@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pymysql
+cryptography
+jinja2
+itsdangerous
+pytest
+httpx

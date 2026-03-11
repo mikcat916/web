@@ -1,0 +1,46 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 | 机器人巡检平台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body class="auth-page">
+  <main class="login-panel">
+    <section class="login-card">
+      <p class="eyebrow">安全登录</p>
+      <h1>机器人巡检平台</h1>
+      <p class="muted">使用数据库用户表登录。默认管理员账号来自 `.env`，未设置时为 `admin / admin123`。</p>
+
+      {% if not mysql_ready %}
+      <div class="notice-card danger">
+        <strong>MySQL 当前不可用</strong>
+        <p>{{ mysql_error or '请先在 .env 中设置 MYSQL_HOST、MYSQL_PORT、MYSQL_USER、MYSQL_PASSWORD、MYSQL_DATABASE。' }}</p>
+      </div>
+      {% endif %}
+
+      <form id="login-form" class="stack-form">
+        <label>
+          <span>用户名</span>
+          <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label>
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <button class="primary-button" type="submit">登录</button>
+        <p id="login-error" class="form-error"></p>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    window.APP_CONFIG = { mysqlReady: {{ mysql_ready|tojson }} };
+  </script>
+  <script src="/static/login.js" defer></script>
+</body>
+</html>
