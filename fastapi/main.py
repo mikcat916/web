@@ -1,22 +1,24 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pymysql
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pymysql.cursors import DictCursor
 from starlette.middleware.sessions import SessionMiddleware
 
+# Runtime paths and bootstrap file locations.
 BASE_DIR = Path(__file__).resolve().parent
 PROTOTYPE_DIR = BASE_DIR / "stitch_monitoring_dashboard"
 STATIC_DIR = BASE_DIR / "static"
@@ -24,6 +26,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 ENV_FILE = BASE_DIR / ".env"
 SCHEMA_FILE = BASE_DIR / "db" / "mysql_schema.sql"
 
+# Legacy prototype routes are kept for compatibility/debug pages.
 PROTOTYPES = {
     "_1": "历史报告",
     "_2": "总览",
@@ -33,6 +36,7 @@ PROTOTYPES = {
     "zone_control": "区域控制",
 }
 
+# Canonical page map: used by template navigation and redirects.
 PAGES = {
     "overview": {"route": "/overview", "title": "总览", "kicker": "系统概览"},
     "tasks": {"route": "/tasks", "title": "任务管理", "kicker": "任务中心"},
@@ -49,6 +53,7 @@ REQUIRED_MYSQL_ENV = (
     "MYSQL_PASSWORD",
     "MYSQL_DATABASE",
 )
+MAX_ID_VALUE = 2_147_483_647
 
 DEFAULT_SITE = {
     "name": "机器人巡检指挥中心",
@@ -58,13 +63,18 @@ DEFAULT_SITE = {
     "zoom": 15.8,
 }
 
+# Global runtime state shared by startup and health checks.
 APP_STATE = {
     "db_ready": False,
     "db_error": "",
 }
+# In-memory websocket registry for dashboard realtime updates.
+WS_CLIENTS: set[WebSocket] = set()
+WS_LOCK = asyncio.Lock()
 
 
 def load_local_env() -> None:
+    # Minimal .env loader to keep deployment dependency-free.
     if not ENV_FILE.exists():
         return
     for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
@@ -79,6 +89,7 @@ load_local_env()
 
 
 def mysql_configured() -> bool:
+    # All required MySQL env vars must be present.
     return all(os.getenv(key, "").strip() for key in REQUIRED_MYSQL_ENV)
 
 
@@ -134,6 +145,7 @@ def ensure_mysql_configured() -> None:
 
 
 def ensure_database() -> None:
+    # Create database if missing before schema execution.
     if not mysql_configured():
         return
     settings = mysql_settings()
@@ -149,6 +161,7 @@ def ensure_database() -> None:
 
 
 def execute_schema() -> None:
+    # Execute SQL bootstrap script in an idempotent way.
     if not mysql_configured() or not SCHEMA_FILE.exists():
         return
     statements = [item.strip() for item in SCHEMA_FILE.read_text(encoding="utf-8").split(";") if item.strip()]
@@ -217,6 +230,7 @@ def get_user_by_username(username: str) -> dict[str, Any] | None:
 
 
 def ensure_admin_user() -> None:
+    # Ensure default admin account exists for first login.
     if not mysql_configured():
         return
     username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
@@ -253,6 +267,7 @@ def template_user(user: dict[str, Any] | None) -> dict[str, str] | None:
 
 
 def require_page_login(request: Request):
+    # HTML pages use redirect semantics for anonymous users.
     user = current_user(request)
     if not user:
         return RedirectResponse(url="/login", status_code=302)
@@ -260,6 +275,7 @@ def require_page_login(request: Request):
 
 
 def require_api_login(request: Request) -> dict[str, Any]:
+    # APIs return 401 for anonymous users.
     user = current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="请先登录。")
@@ -312,6 +328,16 @@ def parse_int_range(value: Any, field_name: str, min_value: int = 0, max_value: 
     return number
 
 
+def parse_strict_id(value: Any, field_name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须是整数。") from exc
+    if number < 1 or number > MAX_ID_VALUE:
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须在 1 到 {MAX_ID_VALUE} 之间。")
+    return number
+
+
 def parse_float(value: Any, field_name: str) -> float:
     try:
         return float(value)
@@ -330,6 +356,7 @@ def format_window(start_at: Any, end_at: Any) -> str:
 
 
 def parse_zone_path(value: Any) -> list[list[float]]:
+    # Accept both JSON string and parsed list payload formats.
     if isinstance(value, list):
         path = value
     else:
@@ -344,8 +371,8 @@ def parse_zone_path(value: Any) -> list[list[float]]:
     for item in path:
         if not isinstance(item, (list, tuple)) or len(item) != 2:
             raise HTTPException(status_code=422, detail="区域路径中的每个点都必须包含经度和纬度。")
-        lng = parse_float(item[0], "区域经度")
-        lat = parse_float(item[1], "区域纬度")
+        lng = parse_float(item[0], "鍖哄煙缁忓害")
+        lat = parse_float(item[1], "鍖哄煙绾害")
         points.append([lng, lat])
     if len(points) < 3:
         raise HTTPException(status_code=422, detail="区域路径至少需要三个点。")
@@ -372,6 +399,7 @@ def zone_center(path: list[list[float]]) -> list[float]:
 
 
 def load_zones() -> list[dict[str, Any]]:
+    # Normalize DB fields to frontend-friendly keys.
     rows = query_all(
         """
         SELECT id, name, type, risk, status, frequency, stroke_color, fill_color, path_json, notes, created_at
@@ -507,6 +535,7 @@ def load_reports() -> list[dict[str, Any]]:
 
 
 def build_maintenance_items(robots: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Aggregate maintenance feed from robot telemetry and alerts.
     items = []
     for robot in robots:
         state = "healthy"
@@ -534,7 +563,7 @@ def build_maintenance_items(robots: list[dict[str, Any]], alerts: list[dict[str,
             {
                 "id": f"alert-{alert['id']}",
                 "asset": alert["title"],
-                "zoneName": "系统",
+                "zoneName": "绯荤粺",
                 "state": "critical" if alert["level"] == "critical" else "warning",
                 "summary": alert["detail"] or "需要后续处理。",
                 "lastCheck": alert["happenedAt"],
@@ -584,6 +613,46 @@ def build_dashboard_payload() -> dict[str, Any]:
         "maintenance": build_maintenance_items(robots, alerts),
         "generatedAt": datetime.now().isoformat(timespec="minutes"),
     }
+
+
+def ws_dashboard_message(event: str) -> dict[str, Any]:
+    # Unified websocket payload shape used by all push events.
+    return {
+        "type": "dashboard_update",
+        "event": event,
+        "pages": PAGES,
+        "data": build_dashboard_payload(),
+        "serverTime": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+async def ws_register(websocket: WebSocket) -> None:
+    async with WS_LOCK:
+        WS_CLIENTS.add(websocket)
+
+
+async def ws_unregister(websocket: WebSocket) -> None:
+    async with WS_LOCK:
+        WS_CLIENTS.discard(websocket)
+
+
+async def ws_broadcast(event: str) -> None:
+    # Broadcast full dashboard snapshot and prune dead connections.
+    async with WS_LOCK:
+        clients = list(WS_CLIENTS)
+    if not clients:
+        return
+    message = ws_dashboard_message(event)
+    stale: list[WebSocket] = []
+    for client in clients:
+        try:
+            await client.send_json(message)
+        except Exception:
+            stale.append(client)
+    if stale:
+        async with WS_LOCK:
+            for client in stale:
+                WS_CLIENTS.discard(client)
 
 
 def build_robot_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -806,7 +875,78 @@ def insert_zone(record: dict[str, Any]) -> None:
 
 
 def clear_table(table_name: str, record_id: int) -> None:
+    # Shared delete helper for CRUD endpoints.
     execute_write(f"DELETE FROM {table_name} WHERE id = %s", (record_id,))
+
+
+def build_robot_record(payload: dict[str, Any]) -> dict[str, Any]:
+    model = str(payload.get("model", "")).strip()
+    if not model:
+        raise HTTPException(status_code=422, detail="机器人名称不能为空。")
+    zone_id = payload.get("zoneId")
+    if zone_id is not None:
+        zone_id = parse_strict_id(zone_id, "zoneId")
+        if not zone_exists(zone_id):
+            raise HTTPException(status_code=404, detail="未找到对应区域。")
+    return {
+        "model": model,
+        "zone_id": zone_id,
+        "status": str(payload.get("status", "idle")).strip() or "idle",
+        "health": parse_int_range(payload.get("health", 92), "health"),
+        "battery": parse_int_range(payload.get("battery", 78), "battery"),
+        "speed": parse_float(payload.get("speed", 1.2), "speed"),
+        "signal": parse_int_range(payload.get("signal", 88), "signal"),
+        "latency": parse_int_range(payload.get("latency", 28), "latency", 0, 1000),
+        "lng": parse_float(payload.get("lng", DEFAULT_SITE["center"][0]), "lng"),
+        "lat": parse_float(payload.get("lat", DEFAULT_SITE["center"][1]), "lat"),
+        "heading": parse_int_range(payload.get("heading", 0), "heading", 0, 360),
+        "created_at": datetime.now(),
+    }
+
+
+def build_task_record(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="任务名称不能为空。")
+    robot_id = payload.get("robotId")
+    zone_id = payload.get("zoneId")
+    if robot_id is not None:
+        robot_id = parse_strict_id(robot_id, "robotId")
+        if not robot_exists(robot_id):
+            raise HTTPException(status_code=404, detail="未找到对应机器人。")
+    if zone_id is not None:
+        zone_id = parse_strict_id(zone_id, "zoneId")
+        if not zone_exists(zone_id):
+            raise HTTPException(status_code=404, detail="未找到对应区域。")
+    start_at = parse_datetime(payload.get("startAt"), "startAt")
+    end_at = parse_datetime(payload.get("endAt"), "endAt")
+    if end_at <= start_at:
+        raise HTTPException(status_code=422, detail="结束时间必须晚于开始时间。")
+    return {
+        "name": name,
+        "robot_id": robot_id,
+        "zone_id": zone_id,
+        "priority": str(payload.get("priority", "medium")).strip() or "medium",
+        "description": str(payload.get("description", "")).strip(),
+        "start_at": start_at,
+        "end_at": end_at,
+        "status": str(payload.get("status", "scheduled")).strip() or "scheduled",
+        "created_at": datetime.now(),
+    }
+
+
+def parse_strict_id(value: Any, field_name: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须是整数。") from exc
+    if number < 1 or number > MAX_ID_VALUE:
+        raise HTTPException(status_code=422, detail=f"{field_name} 必须在 1 到 {MAX_ID_VALUE} 之间。")
+    return number
+
+
+def clear_table(table_name: str, record_id: int) -> int:
+    return execute_write(f"DELETE FROM {table_name} WHERE id = %s", (record_id,))
 
 
 def amap_script_tag() -> str:
@@ -821,6 +961,7 @@ def amap_script_tag() -> str:
 
 
 def render_page(request: Request, page_id: str) -> HTMLResponse | RedirectResponse:
+    # Common page renderer for all protected web pages.
     user = require_page_login(request)
     if isinstance(user, RedirectResponse):
         return user
@@ -853,6 +994,7 @@ def redirect_legacy_page(request: Request, page_id: str) -> RedirectResponse:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Application startup bootstrap: DB + schema + admin seed.
     if mysql_configured():
         try:
             ensure_database()
@@ -869,12 +1011,13 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="机器人巡检平台", lifespan=lifespan)
+app = FastAPI(title="鏈哄櫒浜哄贰妫€骞冲彴", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "change-me"))
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
+# Auth + page routes
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
@@ -977,6 +1120,45 @@ async def api_dashboard(request: Request) -> JSONResponse:
     return JSONResponse({"pages": PAGES, "data": build_dashboard_payload()})
 
 
+# Health + realtime routes
+@app.get("/api/health")
+async def api_health() -> JSONResponse:
+    configured = mysql_configured()
+    ready = mysql_ready()
+    status = "ok" if ready else "degraded"
+    payload = {
+        "status": status,
+        "mysqlConfigured": configured,
+        "mysqlReady": ready,
+        "detail": APP_STATE["db_error"] if APP_STATE["db_error"] else "",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    return JSONResponse(payload, status_code=200 if ready else 503)
+
+
+@app.websocket("/ws/dashboard")
+async def ws_dashboard(websocket: WebSocket):
+    session = websocket.scope.get("session") or {}
+    if not session.get("username"):
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    await ws_register(websocket)
+    try:
+        await websocket.send_json(ws_dashboard_message("connected"))
+        while True:
+            message = await websocket.receive_text()
+            if message.strip().lower() in {"ping", "heartbeat"}:
+                await websocket.send_json({"type": "pong", "serverTime": datetime.now().isoformat(timespec="seconds")})
+            elif message.strip().lower() == "refresh":
+                await websocket.send_json(ws_dashboard_message("refresh"))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await ws_unregister(websocket)
+
+
+# CRUD API routes
 @app.get("/api/tasks")
 async def api_tasks(request: Request) -> JSONResponse:
     require_api_login(request)
@@ -988,13 +1170,17 @@ async def api_create_task(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_task_record(await request.json())
     insert_task(record)
+    await ws_broadcast("task_created")
     return JSONResponse({"ok": True})
 
 
 @app.delete("/api/tasks/{task_id}")
 async def api_delete_task(task_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
-    clear_table("tasks", task_id)
+    task_id = parse_strict_id(task_id, "task_id")
+    if clear_table("tasks", task_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应任务。")
+    await ws_broadcast("task_deleted")
     return JSONResponse({"ok": True})
 
 
@@ -1009,13 +1195,17 @@ async def api_create_robot(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_robot_record(await request.json())
     insert_robot(record)
+    await ws_broadcast("robot_created")
     return JSONResponse({"ok": True})
 
 
 @app.delete("/api/robots/{robot_id}")
 async def api_delete_robot(robot_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
-    clear_table("robots", robot_id)
+    robot_id = parse_strict_id(robot_id, "robot_id")
+    if clear_table("robots", robot_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应机器人。")
+    await ws_broadcast("robot_deleted")
     return JSONResponse({"ok": True})
 
 
@@ -1030,13 +1220,17 @@ async def api_create_alert(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_alert_record(await request.json())
     insert_alert(record)
+    await ws_broadcast("alert_created")
     return JSONResponse({"ok": True})
 
 
 @app.delete("/api/alerts/{alert_id}")
 async def api_delete_alert(alert_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
-    clear_table("alerts", alert_id)
+    alert_id = parse_strict_id(alert_id, "alert_id")
+    if clear_table("alerts", alert_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应告警。")
+    await ws_broadcast("alert_deleted")
     return JSONResponse({"ok": True})
 
 
@@ -1051,13 +1245,17 @@ async def api_create_report(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_report_record(await request.json())
     insert_report(record)
+    await ws_broadcast("report_created")
     return JSONResponse({"ok": True})
 
 
 @app.delete("/api/reports/{report_id}")
 async def api_delete_report(report_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
-    clear_table("reports", report_id)
+    report_id = parse_strict_id(report_id, "report_id")
+    if clear_table("reports", report_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应报告。")
+    await ws_broadcast("report_deleted")
     return JSONResponse({"ok": True})
 
 
@@ -1072,9 +1270,11 @@ async def api_create_zone(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_zone_record(await request.json())
     insert_zone(record)
+    await ws_broadcast("zone_created")
     return JSONResponse({"ok": True})
 
 
+# Utility + prototype routes
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon() -> Response:
     return Response(status_code=204)

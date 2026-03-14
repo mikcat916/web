@@ -13,6 +13,13 @@ const state = {
   pageId: appConfig.pageId,
   data: null,
   maps: {},
+  zoneDraft: {
+    path: [],
+    strokeColor: "#0db9f2",
+    fillColor: "rgba(13, 185, 242, 0.18)",
+    complete: false,
+    clickTimer: null,
+  },
   geo: {
     coords: null,
     promise: null,
@@ -46,6 +53,17 @@ const TOKEN_TEXT = {
   warning: "告警",
 };
 
+const ZONE_PALETTE = [
+  "#0db9f2",
+  "#22c55e",
+  "#f59e0b",
+  "#ef4444",
+  "#6366f1",
+  "#14b8a6",
+  "#eab308",
+  "#f97316",
+];
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -63,6 +81,139 @@ function formatDateTime(value) {
 function localizeToken(value) {
   const token = String(value || "").toLowerCase();
   return TOKEN_TEXT[token] || String(value || "-");
+}
+
+function toRgba(hex, alpha = 0.18) {
+  const normalized = String(hex || "").replace("#", "");
+  if (normalized.length !== 6) return `rgba(13, 185, 242, ${alpha})`;
+  const red = Number.parseInt(normalized.slice(0, 2), 16);
+  const green = Number.parseInt(normalized.slice(2, 4), 16);
+  const blue = Number.parseInt(normalized.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
+
+function resetZoneDraft() {
+  if (state.zoneDraft.clickTimer) {
+    window.clearTimeout(state.zoneDraft.clickTimer);
+    state.zoneDraft.clickTimer = null;
+  }
+  state.zoneDraft.path = [];
+  state.zoneDraft.complete = false;
+  syncZoneDraftUi();
+  refreshZoneDraftPreview();
+}
+
+function updateZoneColor(color) {
+  state.zoneDraft.strokeColor = color;
+  state.zoneDraft.fillColor = toRgba(color);
+  syncZoneDraftUi();
+  refreshZoneDraftPreview();
+}
+
+function syncZoneDraftUi() {
+  const pathField = document.querySelector('#zone-form [name="path"]');
+  const strokeField = document.querySelector('#zone-form [name="strokeColor"]');
+  const fillField = document.querySelector('#zone-form [name="fillColor"]');
+  const status = document.getElementById("zone-draw-status");
+  const preview = document.getElementById("zone-color-preview");
+  const pointCount = state.zoneDraft.path.length;
+  if (pathField) pathField.value = JSON.stringify(state.zoneDraft.path);
+  if (strokeField) strokeField.value = state.zoneDraft.strokeColor;
+  if (fillField) fillField.value = state.zoneDraft.fillColor;
+  if (status) {
+    if (!pointCount) {
+      status.textContent = "地图单击加点，双击完成，右键撤销。";
+    } else if (state.zoneDraft.complete) {
+      status.textContent = `已完成绘制，共 ${pointCount} 个点。`;
+    } else {
+      status.textContent = `已选择 ${pointCount} 个点，至少 3 个点后可完成。`;
+    }
+  }
+  if (preview) {
+    preview.style.background = state.zoneDraft.strokeColor;
+  }
+  document.querySelectorAll("[data-zone-color]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.zoneColor === state.zoneDraft.strokeColor);
+  });
+}
+
+function refreshZoneDraftPreview() {
+  const entry = state.maps["zones-map"];
+  if (!entry?.map) return;
+  if (entry.draftPolyline) {
+    entry.draftPolyline.setMap(null);
+    entry.draftPolyline = null;
+  }
+  if (entry.draftPolygon) {
+    entry.draftPolygon.setMap(null);
+    entry.draftPolygon = null;
+  }
+  const path = state.zoneDraft.path;
+  if (path.length >= 2) {
+    entry.draftPolyline = new AMap.Polyline({
+      map: entry.map,
+      path,
+      strokeColor: state.zoneDraft.strokeColor,
+      strokeWeight: 3,
+      strokeStyle: state.zoneDraft.complete ? "solid" : "dashed",
+    });
+  }
+  if (path.length >= 3) {
+    entry.draftPolygon = new AMap.Polygon({
+      map: entry.map,
+      path,
+      strokeColor: state.zoneDraft.strokeColor,
+      fillColor: state.zoneDraft.fillColor,
+      fillOpacity: state.zoneDraft.complete ? 0.28 : 0.16,
+      strokeWeight: 2,
+    });
+  }
+}
+
+function queueZonePoint(coords) {
+  if (state.zoneDraft.clickTimer) {
+    window.clearTimeout(state.zoneDraft.clickTimer);
+  }
+  state.zoneDraft.clickTimer = window.setTimeout(() => {
+    state.zoneDraft.path = [...state.zoneDraft.path, coords];
+    state.zoneDraft.complete = false;
+    state.zoneDraft.clickTimer = null;
+    syncZoneDraftUi();
+    refreshZoneDraftPreview();
+  }, 220);
+}
+
+function setupZoneDrawing(map) {
+  if (typeof map.setStatus === "function") {
+    map.setStatus({ doubleClickZoom: false });
+  }
+  map.on("click", (event) => {
+    queueZonePoint([event.lnglat.getLng(), event.lnglat.getLat()]);
+  });
+  map.on("dblclick", () => {
+    if (state.zoneDraft.clickTimer) {
+      window.clearTimeout(state.zoneDraft.clickTimer);
+      state.zoneDraft.clickTimer = null;
+    }
+    if (state.zoneDraft.path.length >= 3) {
+      state.zoneDraft.complete = true;
+      syncZoneDraftUi();
+      refreshZoneDraftPreview();
+    }
+  });
+  map.on("rightclick", () => {
+    if (state.zoneDraft.clickTimer) {
+      window.clearTimeout(state.zoneDraft.clickTimer);
+      state.zoneDraft.clickTimer = null;
+    }
+    if (!state.zoneDraft.path.length) return;
+    state.zoneDraft.path = state.zoneDraft.path.slice(0, -1);
+    state.zoneDraft.complete = false;
+    syncZoneDraftUi();
+    refreshZoneDraftPreview();
+  });
+  syncZoneDraftUi();
+  refreshZoneDraftPreview();
 }
 
 function padSerial(value) {
@@ -114,7 +265,6 @@ function friendlyDefaults(formName) {
       type: "inspection",
       frequency: "30分钟/次",
       notes: "覆盖主干道、设备柜和围栏转角。",
-      path: "[[121.81742,31.09161],[121.81942,31.09161],[121.81842,31.09321]]",
     },
   };
 
@@ -591,7 +741,7 @@ function renderZonesPage() {
     ${renderStats()}
     <section class="dual-grid">
       <article class="panel">
-        <div class="panel-header"><div><h2>新建区域</h2><p class="muted">使用 JSON 多边形坐标定义巡检区域</p></div></div>
+        <div class="panel-header"><div><h2>新建区域</h2><p class="muted">在地图上点选轮廓并选择区域颜色</p></div></div>
         <form id="zone-form" class="stack-form">
           <div class="grid-form">
             <label><span>区域名称</span><input name="name" placeholder="例：1号泊位巡检区" required></label>
@@ -599,12 +749,22 @@ function renderZonesPage() {
             <label><span>风险等级</span><select name="risk"><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option></select></label>
             <label><span>状态</span><select name="status"><option value="active" selected>启用</option><option value="paused">暂停</option></select></label>
             <label><span>巡检频率</span><input name="frequency" value="30分钟/次"></label>
-            <label><span>边框颜色</span><input name="strokeColor" value="#7cc7ff"></label>
-            <label><span>填充颜色</span><input name="fillColor" value="rgba(124, 199, 255, 0.18)"></label>
           </div>
-          <label><span>多边形路径 JSON</span><textarea name="path">[[121.81742,31.09161],[121.81942,31.09161],[121.81842,31.09321]]</textarea></label>
+          <input name="strokeColor" type="hidden">
+          <input name="fillColor" type="hidden">
+          <input name="path" type="hidden">
+          <div class="inline-meta">
+            <span class="meta-pill" id="zone-color-preview">色</span>
+            <span class="muted" id="zone-draw-status">地图单击加点，双击完成，右键撤销。</span>
+          </div>
+          <div class="zone-palette">
+            ${ZONE_PALETTE.map((color) => `<button class="zone-color-chip" type="button" data-zone-color="${color}" style="background:${color}"></button>`).join("")}
+          </div>
           <label><span>备注</span><textarea name="notes" placeholder="说明区域用途、重点设备和巡检要求"></textarea></label>
-          <div class="button-row"><button class="primary-button" type="submit">创建区域</button></div>
+          <div class="button-row">
+            <button class="secondary-button" id="zone-reset-button" type="button">清空绘制</button>
+            <button class="primary-button" type="submit">创建区域</button>
+          </div>
           <p class="form-error" data-form-error="zone"></p>
         </form>
       </article>
@@ -682,11 +842,27 @@ async function handleCreate(formName, endpoint, transform = (payload) => payload
       await apiFetch(endpoint, { method: "POST", body: JSON.stringify(payload) });
       form.reset();
       applyFriendlyFormDefaults(formName, form);
+      if (formName === "zone") {
+        resetZoneDraft();
+      }
       await loadDashboard();
     } catch (error) {
       setFormError(formName, error.message);
     }
   });
+}
+
+function bindZoneTools() {
+  if (!document.getElementById("zone-form")) return;
+  document.querySelectorAll("[data-zone-color]").forEach((button) => {
+    button.addEventListener("click", () => {
+      updateZoneColor(button.dataset.zoneColor);
+    });
+  });
+  document.getElementById("zone-reset-button")?.addEventListener("click", () => {
+    resetZoneDraft();
+  });
+  syncZoneDraftUi();
 }
 
 function bindDeleteButtons() {
@@ -707,7 +883,21 @@ function bindForms() {
   handleCreate("robot", "/api/robots", (payload) => numericPayload(payload, ["zoneId", "health", "battery", "speed", "signal", "latency", "lng", "lat", "heading"]));
   handleCreate("alert", "/api/alerts");
   handleCreate("report", "/api/reports");
-  handleCreate("zone", "/api/zones");
+  handleCreate("zone", "/api/zones", (payload) => {
+    if (state.zoneDraft.path.length < 3) {
+      throw new Error("请先在地图上绘制至少 3 个点的区域。");
+    }
+    if (!state.zoneDraft.complete) {
+      throw new Error("请双击地图完成区域绘制后再提交。");
+    }
+    return {
+      ...payload,
+      path: state.zoneDraft.path,
+      strokeColor: state.zoneDraft.strokeColor,
+      fillColor: state.zoneDraft.fillColor,
+    };
+  });
+  bindZoneTools();
   bindDeleteButtons();
 }
 
@@ -758,7 +948,7 @@ async function renderMaps() {
       zoom: state.data.site.zoom,
       center: userCoords || state.data.site.center,
     });
-    state.maps[id] = { map, userMarker: null };
+    state.maps[id] = { map, userMarker: null, draftPolyline: null, draftPolygon: null };
     map.addControl(new AMap.Scale());
     map.addControl(new AMap.ToolBar());
     state.data.zones.forEach((zone) => {
@@ -788,6 +978,9 @@ async function renderMaps() {
           direction: "top",
         },
       });
+    }
+    if (id === "zones-map") {
+      setupZoneDrawing(map);
     }
   });
 }
