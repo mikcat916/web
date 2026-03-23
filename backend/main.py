@@ -5,13 +5,14 @@ import hmac
 import json
 import os
 import asyncio
+import shutil
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pymysql
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -220,7 +221,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 def get_user_by_username(username: str) -> dict[str, Any] | None:
     return query_one(
         """
-        SELECT id, username, password_hash, display_name, created_at
+        SELECT id, username, password_hash, display_name, status, created_at
         FROM users
         WHERE username = %s
         LIMIT 1
@@ -241,8 +242,8 @@ def ensure_admin_user() -> None:
         return
     execute_write(
         """
-        INSERT INTO users (username, password_hash, display_name, created_at)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO users (username, password_hash, display_name, status, created_at)
+        VALUES (%s, %s, %s, 'active', %s)
         """,
         (username, hash_password(password), display_name, datetime.now()),
     )
@@ -1202,6 +1203,508 @@ async def api_create_zone(request: Request) -> JSONResponse:
     insert_zone(record)
     await ws_broadcast("zone_created")
     return JSONResponse({"ok": True})
+
+
+UPLOAD_DIR = STATIC_DIR / "uploads" / "devices"
+
+
+def ensure_upload_dir() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── 用户管理 ──────────────────────────────────────────────────────────────────
+def load_users(page: int = 1, size: int = 20) -> dict[str, Any]:
+    offset = (page - 1) * size
+    total_row = query_one("SELECT COUNT(*) AS cnt FROM users")
+    total = int(total_row["cnt"]) if total_row else 0
+    rows = query_all(
+        "SELECT id, username, display_name, status, created_at FROM users ORDER BY created_at DESC LIMIT %s OFFSET %s",
+        (size, offset),
+    )
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "username": r["username"],
+                "displayName": r["display_name"],
+                "status": r["status"],
+                "createdAt": to_iso_datetime(r["created_at"]),
+            }
+            for r in rows
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
+@app.get("/api/users")
+async def api_users(request: Request, page: int = 1, size: int = 20) -> JSONResponse:
+    require_api_login(request)
+    size = min(max(size, 1), 100)
+    page = max(page, 1)
+    return JSONResponse(
+        load_users(page, size) if mysql_ready() else {"items": [], "total": 0, "page": page, "size": size}
+    )
+
+
+@app.post("/api/users")
+async def api_create_user(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    display_name = str(payload.get("displayName", username)).strip() or username
+    if not username or not password:
+        raise HTTPException(status_code=422, detail="用户名和密码不能为空。")
+    if get_user_by_username(username):
+        raise HTTPException(status_code=409, detail="用户名已存在。")
+    execute_write(
+        "INSERT INTO users (username, password_hash, display_name, status, created_at) VALUES (%s, %s, %s, 'active', %s)",
+        (username, hash_password(password), display_name, datetime.now()),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.put("/api/users/{user_id}")
+async def api_update_user(user_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    user_id = parse_strict_id(user_id, "user_id")
+    payload = await request.json()
+    display_name = str(payload.get("displayName", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    if not display_name and not password:
+        raise HTTPException(status_code=422, detail="至少提供 displayName 或 password 之一。")
+    if display_name:
+        execute_write("UPDATE users SET display_name = %s WHERE id = %s", (display_name, user_id))
+    if password:
+        execute_write("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(password), user_id))
+    return JSONResponse({"ok": True})
+
+
+@app.patch("/api/users/{user_id}/status")
+async def api_update_user_status(user_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    user_id = parse_strict_id(user_id, "user_id")
+    payload = await request.json()
+    status = str(payload.get("status", "")).strip()
+    if status not in {"active", "disabled"}:
+        raise HTTPException(status_code=422, detail="status 必须是 active 或 disabled。")
+    target = query_one("SELECT username FROM users WHERE id = %s", (user_id,))
+    if not target:
+        raise HTTPException(status_code=404, detail="未找到对应用户。")
+    me = current_user(request)
+    if me and me.get("username") == target["username"] and status == "disabled":
+        raise HTTPException(status_code=409, detail="不能禁用当前登录用户。")
+    execute_write("UPDATE users SET status = %s WHERE id = %s", (status, user_id))
+    return JSONResponse({"ok": True})
+
+
+# ── 设备管理 ──────────────────────────────────────────────────────────────────
+def load_devices(area_id: Optional[int] = None, status: Optional[str] = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT d.id, d.name, d.model, d.image_path, d.status, d.area_id,
+               a.name AS area_name, d.notes, d.created_at
+        FROM devices d
+        LEFT JOIN areas a ON a.id = d.area_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if area_id is not None:
+        sql += " AND d.area_id = %s"
+        params.append(area_id)
+    if status:
+        sql += " AND d.status = %s"
+        params.append(status)
+    sql += " ORDER BY d.created_at DESC, d.id DESC"
+    rows = query_all(sql, tuple(params) if params else None)
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "model": r["model"],
+            "imagePath": r["image_path"] or "",
+            "status": r["status"],
+            "areaId": r["area_id"],
+            "areaName": r["area_name"] or "未分配",
+            "notes": r["notes"] or "",
+            "createdAt": to_iso_datetime(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/devices")
+async def api_devices(
+    request: Request, area_id: Optional[int] = None, status: Optional[str] = None
+) -> JSONResponse:
+    require_api_login(request)
+    return JSONResponse({"items": load_devices(area_id, status) if mysql_ready() else []})
+
+
+@app.post("/api/devices")
+async def api_create_device(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    model = str(payload.get("model", "")).strip()
+    if not name or not model:
+        raise HTTPException(status_code=422, detail="设备名称和型号不能为空。")
+    area_id = payload.get("areaId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    execute_write(
+        "INSERT INTO devices (name, model, image_path, status, area_id, notes, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (
+            name, model, str(payload.get("imagePath", "")),
+            str(payload.get("status", "normal")).strip() or "normal",
+            area_id, str(payload.get("notes", "")).strip(), datetime.now(),
+        ),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.put("/api/devices/{device_id}")
+async def api_update_device(device_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    device_id = parse_strict_id(device_id, "device_id")
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    model = str(payload.get("model", "")).strip()
+    if not name or not model:
+        raise HTTPException(status_code=422, detail="设备名称和型号不能为空。")
+    area_id = payload.get("areaId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    affected = execute_write(
+        "UPDATE devices SET name=%s, model=%s, status=%s, area_id=%s, notes=%s WHERE id=%s",
+        (
+            name, model, str(payload.get("status", "normal")).strip() or "normal",
+            area_id, str(payload.get("notes", "")).strip(), device_id,
+        ),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="未找到对应设备。")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/devices/{device_id}")
+async def api_delete_device(device_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    device_id = parse_strict_id(device_id, "device_id")
+    if clear_table("devices", device_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应设备。")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/devices/{device_id}/image")
+async def api_upload_device_image(
+    device_id: int, request: Request, file: UploadFile = File(...)
+) -> JSONResponse:
+    require_api_login(request)
+    device_id = parse_strict_id(device_id, "device_id")
+    if not query_one("SELECT id FROM devices WHERE id = %s", (device_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应设备。")
+    ensure_upload_dir()
+    ext = Path(file.filename or "img.jpg").suffix.lower() or ".jpg"
+    filename = f"device_{device_id}{ext}"
+    dest = UPLOAD_DIR / filename
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    url = f"/static/uploads/devices/{filename}"
+    execute_write("UPDATE devices SET image_path = %s WHERE id = %s", (url, device_id))
+    return JSONResponse({"ok": True, "url": url})
+
+
+# ── 巡检区域 ──────────────────────────────────────────────────────────────────
+def load_areas() -> list[dict[str, Any]]:
+    rows = query_all(
+        "SELECT id, name, description, manager, created_at FROM areas ORDER BY created_at DESC, id DESC"
+    )
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "description": r["description"] or "",
+            "manager": r["manager"] or "",
+            "createdAt": to_iso_datetime(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/areas")
+async def api_areas(request: Request) -> JSONResponse:
+    require_api_login(request)
+    return JSONResponse({"items": load_areas() if mysql_ready() else []})
+
+
+@app.post("/api/areas")
+async def api_create_area(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="区域名称不能为空。")
+    execute_write(
+        "INSERT INTO areas (name, description, manager, created_at) VALUES (%s, %s, %s, %s)",
+        (name, str(payload.get("description", "")).strip(), str(payload.get("manager", "")).strip(), datetime.now()),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.put("/api/areas/{area_id}")
+async def api_update_area(area_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    area_id = parse_strict_id(area_id, "area_id")
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="区域名称不能为空。")
+    affected = execute_write(
+        "UPDATE areas SET name=%s, description=%s, manager=%s WHERE id=%s",
+        (name, str(payload.get("description", "")).strip(), str(payload.get("manager", "")).strip(), area_id),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="未找到对应区域。")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/areas/{area_id}")
+async def api_delete_area(area_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    area_id = parse_strict_id(area_id, "area_id")
+    if clear_table("areas", area_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应区域。")
+    return JSONResponse({"ok": True})
+
+
+# ── 巡检点 ────────────────────────────────────────────────────────────────────
+def load_points(area_id: Optional[int] = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT p.id, p.name, p.area_id, a.name AS area_name,
+               p.device_id, d.name AS device_name, p.lat, p.lng, p.description, p.created_at
+        FROM points p
+        LEFT JOIN areas a ON a.id = p.area_id
+        LEFT JOIN devices d ON d.id = p.device_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if area_id is not None:
+        sql += " AND p.area_id = %s"
+        params.append(area_id)
+    sql += " ORDER BY p.created_at DESC, p.id DESC"
+    rows = query_all(sql, tuple(params) if params else None)
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "areaId": r["area_id"],
+            "areaName": r["area_name"] or "未分配",
+            "deviceId": r["device_id"],
+            "deviceName": r["device_name"] or "无关联设备",
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "description": r["description"] or "",
+            "createdAt": to_iso_datetime(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/points")
+async def api_points(request: Request, area_id: Optional[int] = None) -> JSONResponse:
+    require_api_login(request)
+    return JSONResponse({"items": load_points(area_id) if mysql_ready() else []})
+
+
+@app.post("/api/points")
+async def api_create_point(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="巡检点名称不能为空。")
+    lat = parse_float(payload.get("lat", 0), "lat")
+    lng = parse_float(payload.get("lng", 0), "lng")
+    area_id = payload.get("areaId")
+    device_id = payload.get("deviceId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    if device_id is not None:
+        device_id = parse_strict_id(device_id, "deviceId")
+    execute_write(
+        "INSERT INTO points (name, area_id, device_id, lat, lng, description, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (name, area_id, device_id, lat, lng, str(payload.get("description", "")).strip(), datetime.now()),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.put("/api/points/{point_id}")
+async def api_update_point(point_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    point_id = parse_strict_id(point_id, "point_id")
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="巡检点名称不能为空。")
+    lat = parse_float(payload.get("lat", 0), "lat")
+    lng = parse_float(payload.get("lng", 0), "lng")
+    area_id = payload.get("areaId")
+    device_id = payload.get("deviceId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    if device_id is not None:
+        device_id = parse_strict_id(device_id, "deviceId")
+    affected = execute_write(
+        "UPDATE points SET name=%s, area_id=%s, device_id=%s, lat=%s, lng=%s, description=%s WHERE id=%s",
+        (name, area_id, device_id, lat, lng, str(payload.get("description", "")).strip(), point_id),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="未找到对应巡检点。")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/points/{point_id}")
+async def api_delete_point(point_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    point_id = parse_strict_id(point_id, "point_id")
+    if clear_table("points", point_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应巡检点。")
+    return JSONResponse({"ok": True})
+
+
+# ── 巡检路线 ──────────────────────────────────────────────────────────────────
+def load_routes() -> list[dict[str, Any]]:
+    rows = query_all("""
+        SELECT r.id, r.name, r.description, r.area_id, a.name AS area_name,
+               COUNT(rp.id) AS point_count, r.created_at
+        FROM routes r
+        LEFT JOIN areas a ON a.id = r.area_id
+        LEFT JOIN route_points rp ON rp.route_id = r.id
+        GROUP BY r.id, r.name, r.description, r.area_id, a.name, r.created_at
+        ORDER BY r.created_at DESC, r.id DESC
+    """)
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "description": r["description"] or "",
+            "areaId": r["area_id"],
+            "areaName": r["area_name"] or "未分配",
+            "pointCount": int(r["point_count"]),
+            "createdAt": to_iso_datetime(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def load_route_points(route_id: int) -> list[dict[str, Any]]:
+    rows = query_all("""
+        SELECT p.id, p.name, p.lat, p.lng, p.description, rp.sort_order
+        FROM route_points rp
+        JOIN points p ON p.id = rp.point_id
+        WHERE rp.route_id = %s
+        ORDER BY rp.sort_order ASC, rp.id ASC
+    """, (route_id,))
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "description": r["description"] or "",
+            "sortOrder": int(r["sort_order"]),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/routes")
+async def api_routes(request: Request) -> JSONResponse:
+    require_api_login(request)
+    return JSONResponse({"items": load_routes() if mysql_ready() else []})
+
+
+@app.post("/api/routes")
+async def api_create_route(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="路线名称不能为空。")
+    area_id = payload.get("areaId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    execute_write(
+        "INSERT INTO routes (name, description, area_id, created_at) VALUES (%s, %s, %s, %s)",
+        (name, str(payload.get("description", "")).strip(), area_id, datetime.now()),
+    )
+    return JSONResponse({"ok": True})
+
+
+@app.put("/api/routes/{route_id}")
+async def api_update_route(route_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    route_id = parse_strict_id(route_id, "route_id")
+    payload = await request.json()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="路线名称不能为空。")
+    area_id = payload.get("areaId")
+    if area_id is not None:
+        area_id = parse_strict_id(area_id, "areaId")
+    affected = execute_write(
+        "UPDATE routes SET name=%s, description=%s, area_id=%s WHERE id=%s",
+        (name, str(payload.get("description", "")).strip(), area_id, route_id),
+    )
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="未找到对应路线。")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/routes/{route_id}")
+async def api_delete_route(route_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    route_id = parse_strict_id(route_id, "route_id")
+    if clear_table("routes", route_id) == 0:
+        raise HTTPException(status_code=404, detail="未找到对应路线。")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/routes/{route_id}/points")
+async def api_route_points_get(route_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    route_id = parse_strict_id(route_id, "route_id")
+    if not query_one("SELECT id FROM routes WHERE id = %s", (route_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应路线。")
+    return JSONResponse({"routeId": route_id, "items": load_route_points(route_id) if mysql_ready() else []})
+
+
+@app.put("/api/routes/{route_id}/points")
+async def api_route_points_set(route_id: int, request: Request) -> JSONResponse:
+    require_api_login(request)
+    route_id = parse_strict_id(route_id, "route_id")
+    if not query_one("SELECT id FROM routes WHERE id = %s", (route_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应路线。")
+    payload = await request.json()
+    point_ids = payload.get("pointIds", [])
+    if not isinstance(point_ids, list):
+        raise HTTPException(status_code=422, detail="pointIds 必须是数组。")
+    connection = get_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM route_points WHERE route_id = %s", (route_id,))
+            for order, pid in enumerate(point_ids):
+                pid = parse_strict_id(pid, f"pointIds[{order}]")
+                cursor.execute(
+                    "INSERT INTO route_points (route_id, point_id, sort_order) VALUES (%s, %s, %s)",
+                    (route_id, pid, order),
+                )
+        connection.commit()
+    finally:
+        connection.close()
+    return JSONResponse({"ok": True, "count": len(point_ids)})
 
 
 # Utility + prototype routes
