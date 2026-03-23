@@ -12,7 +12,7 @@ def load_db_config() -> dict:
     return {
         "host": os.getenv("UAV_DB_HOST", "127.0.0.1"),
         "port": int(os.getenv("UAV_DB_PORT", "3306")),
-        "user": os.getenv("UAV_DB_USER", "root"),
+        "user": os.getenv("UAV_DB_USER", "root1"),
         "password": os.getenv("UAV_DB_PASSWORD", "123456"),
-        "database": os.getenv("UAV_DB_NAME", "device_management"),
+        "database": os.getenv("UAV_DB_NAME", "robot_monitor"),
     }
