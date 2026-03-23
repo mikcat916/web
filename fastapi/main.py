@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -371,8 +371,8 @@ def parse_zone_path(value: Any) -> list[list[float]]:
     for item in path:
         if not isinstance(item, (list, tuple)) or len(item) != 2:
             raise HTTPException(status_code=422, detail="区域路径中的每个点都必须包含经度和纬度。")
-        lng = parse_float(item[0], "鍖哄煙缁忓害")
-        lat = parse_float(item[1], "鍖哄煙绾害")
+        lng = parse_float(item[0], "区域经度")
+        lat = parse_float(item[1], "区域纬度")
         points.append([lng, lat])
     if len(points) < 3:
         raise HTTPException(status_code=422, detail="区域路径至少需要三个点。")
@@ -535,17 +535,21 @@ def load_reports() -> list[dict[str, Any]]:
 
 
 def build_maintenance_items(robots: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Aggregate maintenance feed from robot telemetry and alerts.
+    # Aggregate maintenance feed using real robot status from DB.
+    _STATUS_MAP = {
+        "active": ("active", "正在执行巡检任务。"),
+        "idle": ("healthy", "机器人待命中，状态正常。"),
+        "charging": ("healthy", "机器人正在充电。"),
+        "offline": ("critical", "机器人已离线，需要人工介入。"),
+    }
     items = []
     for robot in robots:
-        state = "healthy"
-        summary = "例行巡检状态正常。"
-        if robot["health"] < 60 or robot["battery"] < 40:
+        raw_status = str(robot.get("status", "")).lower()
+        state, summary = _STATUS_MAP.get(raw_status, ("warning", "状态未知，请确认机器人连接。"))
+        # Low battery overrides to warning unless already critical.
+        if state != "critical" and robot["battery"] < 20:
             state = "warning"
-            summary = "电量或健康度指标需要关注。"
-        if robot["status"] == "offline":
-            state = "critical"
-            summary = "机器人已离线，需要人工介入。"
+            summary = f"电量偏低（{robot['battery']}%），建议及时充电。"
         items.append(
             {
                 "id": f"robot-{robot['id']}",
@@ -563,7 +567,7 @@ def build_maintenance_items(robots: list[dict[str, Any]], alerts: list[dict[str,
             {
                 "id": f"alert-{alert['id']}",
                 "asset": alert["title"],
-                "zoneName": "绯荤粺",
+                "zoneName": "系统",
                 "state": "critical" if alert["level"] == "critical" else "warning",
                 "summary": alert["detail"] or "需要后续处理。",
                 "lastCheck": alert["happenedAt"],
@@ -655,69 +659,8 @@ async def ws_broadcast(event: str) -> None:
                 WS_CLIENTS.discard(client)
 
 
-def build_robot_record(payload: dict[str, Any]) -> dict[str, Any]:
-    model = str(payload.get("model", "")).strip()
-    if not model:
-        raise HTTPException(status_code=422, detail="机器人名称不能为空。")
-    zone_id = payload.get("zoneId")
-    if zone_id is not None:
-        try:
-            zone_id = int(zone_id)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail="zoneId 必须是整数。") from exc
-        if not zone_exists(zone_id):
-            raise HTTPException(status_code=404, detail="未找到对应区域。")
-    return {
-        "model": model,
-        "zone_id": zone_id,
-        "status": str(payload.get("status", "idle")).strip() or "idle",
-        "health": parse_int_range(payload.get("health", 92), "health"),
-        "battery": parse_int_range(payload.get("battery", 78), "battery"),
-        "speed": parse_float(payload.get("speed", 1.2), "speed"),
-        "signal": parse_int_range(payload.get("signal", 88), "signal"),
-        "latency": parse_int_range(payload.get("latency", 28), "latency", 0, 1000),
-        "lng": parse_float(payload.get("lng", DEFAULT_SITE["center"][0]), "lng"),
-        "lat": parse_float(payload.get("lat", DEFAULT_SITE["center"][1]), "lat"),
-        "heading": parse_int_range(payload.get("heading", 0), "heading", 0, 360),
-        "created_at": datetime.now(),
-    }
 
 
-def build_task_record(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name", "")).strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="任务名称不能为空。")
-    robot_id = payload.get("robotId")
-    zone_id = payload.get("zoneId")
-    if robot_id is not None:
-        try:
-            robot_id = int(robot_id)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail="robotId 必须是整数。") from exc
-        if not robot_exists(robot_id):
-            raise HTTPException(status_code=404, detail="未找到对应机器人。")
-    if zone_id is not None:
-        try:
-            zone_id = int(zone_id)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail="zoneId 必须是整数。") from exc
-        if not zone_exists(zone_id):
-            raise HTTPException(status_code=404, detail="未找到对应区域。")
-    start_at = parse_datetime(payload.get("startAt"), "startAt")
-    end_at = parse_datetime(payload.get("endAt"), "endAt")
-    if end_at <= start_at:
-        raise HTTPException(status_code=422, detail="结束时间必须晚于开始时间。")
-    return {
-        "name": name,
-        "robot_id": robot_id,
-        "zone_id": zone_id,
-        "priority": str(payload.get("priority", "medium")).strip() or "medium",
-        "description": str(payload.get("description", "")).strip(),
-        "start_at": start_at,
-        "end_at": end_at,
-        "status": str(payload.get("status", "scheduled")).strip() or "scheduled",
-        "created_at": datetime.now(),
-    }
 
 
 def build_alert_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -874,9 +817,6 @@ def insert_zone(record: dict[str, Any]) -> None:
     )
 
 
-def clear_table(table_name: str, record_id: int) -> None:
-    # Shared delete helper for CRUD endpoints.
-    execute_write(f"DELETE FROM {table_name} WHERE id = %s", (record_id,))
 
 
 def build_robot_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -899,7 +839,7 @@ def build_robot_record(payload: dict[str, Any]) -> dict[str, Any]:
         "latency": parse_int_range(payload.get("latency", 28), "latency", 0, 1000),
         "lng": parse_float(payload.get("lng", DEFAULT_SITE["center"][0]), "lng"),
         "lat": parse_float(payload.get("lat", DEFAULT_SITE["center"][1]), "lat"),
-        "heading": parse_int_range(payload.get("heading", 0), "heading", 0, 360),
+        "heading": parse_int_range(payload.get("heading", 0), "heading", 0, 359),
         "created_at": datetime.now(),
     }
 
@@ -933,16 +873,6 @@ def build_task_record(payload: dict[str, Any]) -> dict[str, Any]:
         "status": str(payload.get("status", "scheduled")).strip() or "scheduled",
         "created_at": datetime.now(),
     }
-
-
-def parse_strict_id(value: Any, field_name: str) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"{field_name} 必须是整数。") from exc
-    if number < 1 or number > MAX_ID_VALUE:
-        raise HTTPException(status_code=422, detail=f"{field_name} 必须在 1 到 {MAX_ID_VALUE} 之间。")
-    return number
 
 
 def clear_table(table_name: str, record_id: int) -> int:

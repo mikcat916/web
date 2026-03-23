@@ -1,4 +1,4 @@
-﻿const appConfig = window.APP_CONFIG || {};
+const appConfig = window.APP_CONFIG || {};
 const pageContent = document.getElementById("page-content");
 const logoutButton = document.getElementById("logout-button");
 const generatedAt = document.getElementById("generated-at");
@@ -673,7 +673,7 @@ function renderStatusPage() {
             <label><span>延迟</span><input name="latency" type="number" value="28"></label>
             <label><span>经度</span><input name="lng" type="number" step="0.000001" value="121.81742"></label>
             <label><span>纬度</span><input name="lat" type="number" step="0.000001" value="31.09161"></label>
-            <label><span>航向角</span><input name="heading" type="number" value="0" min="0" max="360"></label>
+            <label><span>航向角</span><input name="heading" type="number" value="0" min="0" max="359"></label>
           </div>
           <div class="button-row"><button class="primary-button" type="submit">添加机器人</button></div>
           <p class="form-error" data-form-error="robot"></p>
