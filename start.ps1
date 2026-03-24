@@ -1,11 +1,10 @@
-# 机器人巡检监控系统 - 一键启动脚本
-# 使用方式：在 PowerShell 中运行 .\start.ps1，或双击 start.bat
+# Robot Inspection System - Start Script
+# Usage: Double-click start.bat, or run .\start.ps1 in PowerShell
 
 $ROOT = $PSScriptRoot
 $CONDA_PYTHON = "$ROOT\.conda\python.exe"
 $BACKEND_DIR = "$ROOT\backend"
 
-# ── 颜色输出工具 ─────────────────────────────────────────────
 function Info($msg)    { Write-Host "  [INFO] $msg" -ForegroundColor Cyan }
 function Success($msg) { Write-Host "  [ OK ] $msg" -ForegroundColor Green }
 function Warn($msg)    { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
@@ -13,41 +12,43 @@ function Err($msg)     { Write-Host "  [ERR ] $msg" -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "  ==========================================" -ForegroundColor Blue
-Write-Host "   机器人巡检监控系统 - 一键启动" -ForegroundColor Blue
+Write-Host "   Robot Inspection System - Starting..." -ForegroundColor Blue
 Write-Host "  ==========================================" -ForegroundColor Blue
 Write-Host ""
 
-# ── 检查 Python 环境 ──────────────────────────────────────────
+# Check Python
 if (Test-Path $CONDA_PYTHON) {
-    Success "找到本地 conda 环境：.conda\python.exe"
+    Success "Found local conda env: .conda\python.exe"
     $PYTHON = $CONDA_PYTHON
 } else {
-    Warn "未找到本地 .conda 环境，尝试使用系统 Python..."
-    $PYTHON = (Get-Command python -ErrorAction SilentlyContinue)?.Source
+    Warn "Local .conda not found, trying system Python..."
+    $PYTHON = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $PYTHON) {
-        Err "未找到 Python，请先安装 conda 环境或确认 Python 在 PATH 中。"
+        Err "Python not found. Please install conda env or add Python to PATH."
+        Read-Host "Press Enter to exit"
         exit 1
     }
-    Info "使用系统 Python：$PYTHON"
+    Info "Using system Python: $PYTHON"
 }
 
-# ── 检查 uvicorn ──────────────────────────────────────────────
-$UVICORN = Split-Path $PYTHON | Join-Path -ChildPath "uvicorn.exe"
-if (-not (Test-Path $UVICORN)) {
-    Info "正在安装依赖（pip install -r requirements.txt）..."
+# Check uvicorn, install deps if missing
+$UVICORN_MODULE = & $PYTHON -c "import uvicorn; print('ok')" 2>$null
+if ($UVICORN_MODULE -ne "ok") {
+    Info "Installing dependencies..."
     & $PYTHON -m pip install -r "$BACKEND_DIR\requirements.txt" -q
     if ($LASTEXITCODE -ne 0) {
-        Err "依赖安装失败，请检查网络或手动运行 pip install。"
+        Err "Failed to install dependencies."
+        Read-Host "Press Enter to exit"
         exit 1
     }
-    Success "依赖安装完成。"
+    Success "Dependencies installed."
 }
 
-# ── 启动后端服务 ──────────────────────────────────────────────
-Info "正在启动后端服务..."
-Info "地址：http://localhost:8000"
+# Start backend
+Info "Starting backend server..."
+Info "URL: http://localhost:8000"
 Write-Host ""
-Write-Host "  按 Ctrl+C 停止服务" -ForegroundColor DarkGray
+Write-Host "  Press Ctrl+C to stop" -ForegroundColor DarkGray
 Write-Host ""
 
 Set-Location $BACKEND_DIR
