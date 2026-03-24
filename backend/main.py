@@ -45,6 +45,11 @@ PAGES = {
     "status": {"route": "/robots", "title": "机器人状态", "kicker": "设备状态"},
     "maintenance": {"route": "/maintenance", "title": "设备维护", "kicker": "维护中心"},
     "zones": {"route": "/zones", "title": "区域控制", "kicker": "区域管理"},
+    "users": {"route": "/users", "title": "用户管理", "kicker": "账号中心"},
+    "devices": {"route": "/devices", "title": "设备管理", "kicker": "设备信息"},
+    "areas": {"route": "/areas", "title": "巡检区域", "kicker": "区域配置"},
+    "points": {"route": "/points", "title": "巡检点", "kicker": "点位配置"},
+    "routes": {"route": "/routes", "title": "巡检路线", "kicker": "路线配置"},
 }
 
 REQUIRED_MYSQL_ENV = (
@@ -1043,6 +1048,31 @@ async def legacy_zones_page(request: Request):
 @app.get("/zones", response_class=HTMLResponse)
 async def zones_page(request: Request):
     return render_page(request, "zones")
+
+
+@app.get("/users", response_class=HTMLResponse)
+async def users_page(request: Request):
+    return render_page(request, "users")
+
+
+@app.get("/devices", response_class=HTMLResponse)
+async def devices_page(request: Request):
+    return render_page(request, "devices")
+
+
+@app.get("/areas", response_class=HTMLResponse)
+async def areas_page(request: Request):
+    return render_page(request, "areas")
+
+
+@app.get("/points", response_class=HTMLResponse)
+async def points_page(request: Request):
+    return render_page(request, "points")
+
+
+@app.get("/routes", response_class=HTMLResponse)
+async def routes_mgmt_page(request: Request):
+    return render_page(request, "routes")
 
 
 @app.get("/api/dashboard")

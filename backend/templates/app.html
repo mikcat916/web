@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -69,6 +69,21 @@
       <div id="page-content" class="page-content"></div>
     </main>
   </div>
+
+  <dialog id="crud-modal" class="crud-modal">
+    <form id="crud-modal-form" method="dialog" class="stack-form">
+      <div class="modal-header">
+        <strong id="crud-modal-title">编辑</strong>
+        <button class="ghost-button" value="cancel" type="submit" style="padding:6px 10px">✕</button>
+      </div>
+      <div id="crud-modal-body" class="grid-form"></div>
+      <div class="button-row">
+        <button class="primary-button" id="crud-modal-save" type="button">保存</button>
+        <button class="secondary-button" value="cancel" type="submit">取消</button>
+      </div>
+      <p class="form-error" id="crud-modal-error"></p>
+    </form>
+  </dialog>
 
   <script>
     window.APP_CONFIG = {
