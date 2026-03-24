@@ -46,7 +46,8 @@ if ($UVICORN_MODULE -ne "ok") {
 
 # Start backend
 Info "Starting backend server..."
-Info "URL: http://localhost:8000"
+Info "Open in browser: http://localhost:8000"
+Info "Login: admin / admin123"
 Write-Host ""
 Write-Host "  Press Ctrl+C to stop" -ForegroundColor DarkGray
 Write-Host ""
