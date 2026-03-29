@@ -9,7 +9,8 @@ from typing import Iterable
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_ENV_FILE = ROOT_DIR / "backend" / ".env"
+DEFAULT_ENV_FILE = ROOT_DIR / ".env"
+LEGACY_ENV_FILE = ROOT_DIR / "backend" / ".env"
 DEFAULT_SCHEMA_FILE = ROOT_DIR / "backend" / "db" / "mysql_schema.sql"
 
 DEVICE_PIN_SQL = """
@@ -201,6 +202,8 @@ def create_database(conn, database: str, charset: str, collation: str) -> None:
 
 def build_config(args: argparse.Namespace) -> dict:
     load_dotenv(args.env_file)
+    if args.env_file != LEGACY_ENV_FILE:
+        load_dotenv(LEGACY_ENV_FILE)
     port_value = args.port
     if port_value is None:
         port_value = int(pick_value(None, "UAV_DB_PORT", "MYSQL_PORT", default="3306"))

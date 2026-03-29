@@ -21,9 +21,11 @@ from starlette.middleware.sessions import SessionMiddleware
 
 # Runtime paths and bootstrap file locations.
 BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
 PROTOTYPE_DIR = BASE_DIR / "stitch_monitoring_dashboard"
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
+ROOT_ENV_FILE = ROOT_DIR / ".env"
 ENV_FILE = BASE_DIR / ".env"
 SCHEMA_FILE = BASE_DIR / "db" / "mysql_schema.sql"
 
@@ -79,19 +81,23 @@ WS_CLIENTS: set[WebSocket] = set()
 WS_LOCK = asyncio.Lock()
 
 
-def load_local_env() -> None:
+def load_local_env(path: Path, overwrite: bool = True) -> None:
     # Minimal .env loader to keep deployment dependency-free.
-    if not ENV_FILE.exists():
+    if not path.exists():
         return
-    for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip()
+        key = key.strip()
+        value = value.strip()
+        if overwrite or key not in os.environ:
+            os.environ[key] = value
 
 
-load_local_env()
+load_local_env(ROOT_ENV_FILE, overwrite=False)
+load_local_env(ENV_FILE, overwrite=True)
 
 
 def mysql_configured() -> bool:
