@@ -47,3 +47,6 @@ Thumbs.db
 
 # 空目录占位
 !.gitkeep
+
+# Office temp lock files
+~$*

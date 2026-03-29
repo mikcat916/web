@@ -8,11 +8,22 @@ const gpsStatus = document.getElementById("gps-status");
 const systemLocation = document.getElementById("system-location");
 const heroLocation = document.getElementById("hero-location");
 const currentLocation = document.getElementById("current-location");
+const crudModal = document.getElementById("crud-modal");
+const crudModalForm = document.getElementById("crud-modal-form");
+const crudModalTitle = document.getElementById("crud-modal-title");
+const crudModalBody = document.getElementById("crud-modal-body");
+const crudModalError = document.getElementById("crud-modal-error");
+const crudModalSave = document.getElementById("crud-modal-save");
 
 const state = {
   pageId: appConfig.pageId,
   data: null,
   maps: {},
+  pageData: {},
+  routeEditor: { routeId: null, selected: [] },
+  deviceFilters: { keyword: "", status: "" },
+  deviceImageDraft: { file: null, previewUrl: "", fileName: "" },
+  modal: { onSubmit: null },
   zoneDraft: {
     path: [],
     strokeColor: "#0db9f2",
@@ -33,6 +44,7 @@ const TOKEN_TEXT = {
   active: "运行中",
   charging: "充电中",
   critical: "严重",
+  disabled: "已停用",
   degraded: "性能下降",
   good: "良好",
   healthy: "正常",
@@ -43,10 +55,12 @@ const TOKEN_TEXT = {
   low: "低",
   medium: "中",
   neutral: "平稳",
+  normal: "正常",
   offline: "离线",
   online: "在线",
   paused: "暂停",
   positive: "上升",
+  repair: "维修中",
   restricted: "管控区",
   scheduled: "已排期",
   storage: "仓储区",
@@ -790,6 +804,1031 @@ function renderZonesPage() {
   `;
 }
 
+function renderLoadingPage(title, description) {
+  return `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>${escapeHtml(title)}</h2>
+          <p class="muted">${escapeHtml(description)}</p>
+        </div>
+      </div>
+      <div class="empty-state">加载中...</div>
+    </section>
+  `;
+}
+
+function renderSelectOptions(items, selectedValue = "", emptyLabel = "未设置") {
+  const normalized = selectedValue === undefined || selectedValue === null ? "" : String(selectedValue);
+  const options = [];
+  if (emptyLabel !== null) {
+    options.push(`<option value="">${escapeHtml(emptyLabel)}</option>`);
+  }
+  items.forEach((item) => {
+    const value = String(item.id);
+    const label = String(item.name || item.title || item.username || item.displayName || item.id);
+    options.push(
+      `<option value="${escapeHtml(value)}"${value === normalized ? " selected" : ""}>${escapeHtml(label)}</option>`,
+    );
+  });
+  return options.join("");
+}
+
+function formatCoordinate(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(6) : "-";
+}
+
+function findPageItem(pageId, itemId) {
+  const source = state.pageData[pageId];
+  const items = Array.isArray(source?.items) ? source.items : [];
+  return items.find((item) => Number(item.id) === Number(itemId)) || null;
+}
+
+async function ensureManagementPageData(pageId, force = false) {
+  if (!force && state.pageData[pageId]) {
+    return state.pageData[pageId];
+  }
+
+  if (pageId === "users") {
+    state.pageData.users = await apiFetch("/api/users?page=1&size=100");
+  } else if (pageId === "devices") {
+    const [devices, areas] = await Promise.all([apiFetch("/api/devices"), apiFetch("/api/areas")]);
+    state.pageData.devices = { items: devices.items || [], areas: areas.items || [] };
+  } else if (pageId === "areas") {
+    state.pageData.areas = await apiFetch("/api/areas");
+  } else if (pageId === "points") {
+    const [points, areas, devices] = await Promise.all([
+      apiFetch("/api/points"),
+      apiFetch("/api/areas"),
+      apiFetch("/api/devices"),
+    ]);
+    state.pageData.points = {
+      items: points.items || [],
+      areas: areas.items || [],
+      devices: devices.items || [],
+    };
+  } else if (pageId === "routes") {
+    const previousRoutePoints = state.pageData.routes?.routePoints || {};
+    const [routes, areas, points] = await Promise.all([
+      apiFetch("/api/routes"),
+      apiFetch("/api/areas"),
+      apiFetch("/api/points"),
+    ]);
+    state.pageData.routes = {
+      items: routes.items || [],
+      areas: areas.items || [],
+      points: points.items || [],
+      routePoints: previousRoutePoints,
+    };
+    if (
+      state.routeEditor.routeId &&
+      !state.pageData.routes.items.some((route) => Number(route.id) === Number(state.routeEditor.routeId))
+    ) {
+      state.routeEditor = { routeId: null, selected: [] };
+    }
+  }
+
+  if (state.pageId === pageId) {
+    renderCurrentPage();
+  }
+  return state.pageData[pageId];
+}
+
+async function ensureRoutePoints(routeId, force = false) {
+  if (!state.pageData.routes) {
+    await ensureManagementPageData("routes");
+  }
+  const current = state.pageData.routes?.routePoints?.[routeId];
+  if (!force && current) {
+    state.routeEditor.selected = current.map((item) => item.id);
+    return current;
+  }
+  const payload = await apiFetch(`/api/routes/${routeId}/points`);
+  state.pageData.routes.routePoints = {
+    ...(state.pageData.routes.routePoints || {}),
+    [routeId]: payload.items || [],
+  };
+  state.routeEditor.selected = (payload.items || []).map((item) => item.id);
+  if (state.pageId === "routes") {
+    renderCurrentPage();
+  }
+  return payload.items || [];
+}
+
+function bindManagedForm(formId, errorKey, handler) {
+  const form = document.getElementById(formId);
+  if (!form) return;
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setFormError(errorKey);
+    try {
+      await handler(form);
+    } catch (error) {
+      setFormError(errorKey, error.message);
+    }
+  });
+}
+
+function renderModalField(field, values) {
+  const value = values[field.name] ?? "";
+  const required = field.required ? "required" : "";
+  const disabled = field.disabled ? "disabled" : "";
+  const readonly = field.readonly ? "readonly" : "";
+  const className = field.className ? ` ${field.className}` : "";
+
+  if (field.type === "select") {
+    return `
+      <label class="${className.trim()}">
+        <span>${escapeHtml(field.label)}</span>
+        <select name="${escapeHtml(field.name)}" ${required} ${disabled}>
+          ${(field.options || []).map((option) => {
+            const optionValue = String(option.value);
+            return `<option value="${escapeHtml(optionValue)}"${optionValue === String(value) ? " selected" : ""}>${escapeHtml(option.label)}</option>`;
+          }).join("")}
+        </select>
+      </label>
+    `;
+  }
+
+  if (field.type === "textarea") {
+    return `
+      <label class="${className.trim()}">
+        <span>${escapeHtml(field.label)}</span>
+        <textarea name="${escapeHtml(field.name)}" placeholder="${escapeHtml(field.placeholder || "")}" ${required} ${disabled} ${readonly}>${escapeHtml(value)}</textarea>
+      </label>
+    `;
+  }
+
+  return `
+    <label class="${className.trim()}">
+      <span>${escapeHtml(field.label)}</span>
+      <input
+        name="${escapeHtml(field.name)}"
+        type="${escapeHtml(field.type || "text")}"
+        value="${escapeHtml(value)}"
+        placeholder="${escapeHtml(field.placeholder || "")}"
+        ${required}
+        ${disabled}
+        ${readonly}
+        ${field.min !== undefined ? `min="${escapeHtml(field.min)}"` : ""}
+        ${field.max !== undefined ? `max="${escapeHtml(field.max)}"` : ""}
+        ${field.step !== undefined ? `step="${escapeHtml(field.step)}"` : ""}
+      />
+    </label>
+  `;
+}
+
+function closeCrudModal() {
+  state.modal.onSubmit = null;
+  if (crudModalError) crudModalError.textContent = "";
+  if (crudModalBody) crudModalBody.innerHTML = "";
+  crudModalForm?.reset();
+  if (!crudModal) return;
+  if (typeof crudModal.close === "function" && crudModal.open) {
+    crudModal.close();
+  } else {
+    crudModal.removeAttribute("open");
+  }
+}
+
+function showCrudModal({ title, fields, values = {}, saveText = "保存", onSubmit }) {
+  if (!crudModal || !crudModalForm || !crudModalBody || !crudModalTitle || !crudModalSave) {
+    return;
+  }
+  if (crudModal.open && typeof crudModal.close === "function") {
+    crudModal.close();
+  }
+  crudModalTitle.textContent = title;
+  crudModalSave.textContent = saveText;
+  crudModalError.textContent = "";
+  crudModalBody.innerHTML = fields.map((field) => renderModalField(field, values)).join("");
+  state.modal.onSubmit = async () => {
+    crudModalError.textContent = "";
+    crudModalSave.disabled = true;
+    try {
+      const payload = formToObject(crudModalForm);
+      await onSubmit(payload);
+      closeCrudModal();
+    } catch (error) {
+      crudModalError.textContent = error.message;
+    } finally {
+      crudModalSave.disabled = false;
+    }
+  };
+  if (typeof crudModal.showModal === "function") {
+    crudModal.showModal();
+  } else {
+    crudModal.setAttribute("open", "open");
+  }
+}
+
+async function apiUpload(url, formData) {
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    body: formData,
+  });
+  if (response.status === 401) {
+    window.location.href = "/login";
+    throw new Error("登录状态已失效，请重新登录。");
+  }
+  const isJson = response.headers.get("content-type")?.includes("application/json");
+  const payload = isJson ? await response.json() : null;
+  if (!response.ok) {
+    throw new Error(payload?.detail || `请求失败：${response.status}`);
+  }
+  return payload;
+}
+
+function clearDeviceImageDraft() {
+  if (state.deviceImageDraft.previewUrl) {
+    URL.revokeObjectURL(state.deviceImageDraft.previewUrl);
+  }
+  state.deviceImageDraft = { file: null, previewUrl: "", fileName: "" };
+}
+
+function setDeviceImageDraft(file) {
+  clearDeviceImageDraft();
+  if (!file) return;
+  state.deviceImageDraft = {
+    file,
+    previewUrl: URL.createObjectURL(file),
+    fileName: file.name,
+  };
+}
+
+function getFilteredDevices(items) {
+  const keyword = state.deviceFilters.keyword.trim().toLowerCase();
+  const status = state.deviceFilters.status;
+  return (items || []).filter((device) => {
+    const matchesKeyword = !keyword || [device.name, device.model, device.areaName, device.notes]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(keyword));
+    const matchesStatus = !status || device.status === status;
+    return matchesKeyword && matchesStatus;
+  });
+}
+
+crudModalSave?.addEventListener("click", async () => {
+  if (!state.modal.onSubmit) return;
+  await state.modal.onSubmit();
+});
+
+crudModal?.addEventListener("close", () => {
+  state.modal.onSubmit = null;
+  if (crudModalError) crudModalError.textContent = "";
+  if (crudModalBody) crudModalBody.innerHTML = "";
+  crudModalForm?.reset();
+});
+
+function renderUsersPage() {
+  const usersData = state.pageData.users;
+  if (!usersData) {
+    return renderLoadingPage("用户管理", "创建账号并管理访问权限。");
+  }
+  const activeCount = (usersData.items || []).filter((user) => user.status === "active").length;
+  const disabledCount = (usersData.items || []).filter((user) => user.status === "disabled").length;
+  const rows = (usersData.items || []).map((user) => `
+    <tr>
+      <td>${escapeHtml(user.username)}</td>
+      <td>${escapeHtml(user.displayName || "-")}</td>
+      <td><span class="${pillClass(user.status)}">${escapeHtml(localizeToken(user.status))}</span></td>
+      <td>${escapeHtml(formatDateTime(user.createdAt))}</td>
+      <td>
+        <div class="inline-meta">
+          <button class="secondary-button" type="button" data-user-edit data-id="${user.id}">编辑</button>
+          <button class="ghost-button" type="button" data-user-toggle data-id="${user.id}" data-next-status="${user.status === "active" ? "disabled" : "active"}">
+            ${user.status === "active" ? "停用" : "启用"}
+          </button>
+        </div>
+      </td>
+    </tr>
+  `);
+  return `
+    <section class="metric-grid">
+      <article class="metric-card"><strong>账号总数</strong><span class="muted">${usersData.total || (usersData.items || []).length} 个</span></article>
+      <article class="metric-card"><strong>启用中</strong><span class="muted">${activeCount} 个</span></article>
+      <article class="metric-card"><strong>已停用</strong><span class="muted">${disabledCount} 个</span></article>
+    </section>
+    <section class="page-content">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>用户列表</h2>
+            <p class="muted">支持状态切换，并通过弹窗新增或编辑用户。</p>
+          </div>
+          <div class="panel-actions">
+            <button class="primary-button" type="button" data-user-create>新增用户</button>
+          </div>
+        </div>
+        ${renderTable("users", ["用户名", "显示名称", "状态", "创建时间", "操作"], rows)}
+      </article>
+    </section>
+  `;
+}
+
+function renderDevicesPage() {
+  const devicesData = state.pageData.devices;
+  if (!devicesData) {
+    return renderLoadingPage("设备管理", "管理设备并分配所属区域。");
+  }
+  const previewUrl = state.deviceImageDraft.previewUrl;
+  const filteredDevices = getFilteredDevices(devicesData.items || []);
+  const rows = filteredDevices.map((device) => `
+    <tr>
+      <td>${escapeHtml(device.name)}</td>
+      <td>${escapeHtml(device.model)}</td>
+      <td>${escapeHtml(device.areaName || "-")}</td>
+      <td><span class="${pillClass(device.status)}">${escapeHtml(localizeToken(device.status))}</span></td>
+      <td>${device.imagePath ? `<img class="device-thumb" src="${escapeHtml(device.imagePath)}" alt="${escapeHtml(device.name)}">` : "-"}</td>
+      <td>
+        <div class="inline-meta">
+          <button class="secondary-button" type="button" data-device-edit data-id="${device.id}">编辑</button>
+          <button class="danger-button" type="button" data-device-delete data-id="${device.id}">删除</button>
+        </div>
+      </td>
+    </tr>
+  `);
+  return `
+    <section class="dual-grid">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>设备登记</h2>
+            <p class="muted">登记平台设备并绑定所属区域。</p>
+          </div>
+        </div>
+        <form id="device-form" class="stack-form">
+          <div class="grid-form">
+            <label><span>名称</span><input name="name" required /></label>
+            <label><span>型号</span><input name="model" required /></label>
+            <label><span>状态</span>
+              <select name="status">
+                <option value="normal">正常</option>
+                <option value="repair">维修中</option>
+                <option value="offline">离线</option>
+              </select>
+            </label>
+            <label><span>区域</span>
+              <select name="areaId">${renderSelectOptions(devicesData.areas || [], "", "未设置")}</select>
+            </label>
+          </div>
+          <label><span>备注</span><textarea name="notes" placeholder="可选设备备注"></textarea></label>
+          <div class="device-upload-grid">
+            <label>
+              <span>设备图片</span>
+              <input id="device-image-input" type="file" accept="image/*" />
+            </label>
+            <div class="image-preview-card">
+              <div class="image-preview-shell">
+                ${previewUrl ? `<img src="${escapeHtml(previewUrl)}" alt="设备预览">` : `<span class="muted">选择图片后在这里预览</span>`}
+              </div>
+              <div class="inline-meta">
+                <span class="muted">${escapeHtml(state.deviceImageDraft.fileName || "未选择图片")}</span>
+                <button class="ghost-button" id="device-image-clear" type="button">清空图片</button>
+              </div>
+            </div>
+          </div>
+          <div class="button-row">
+            <button class="primary-button" type="submit">新建设备</button>
+          </div>
+          <p class="form-error" data-form-error="device"></p>
+        </form>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>设备列表</h2>
+            <p class="muted">支持按名称、型号、区域和状态筛选。</p>
+          </div>
+          <div class="panel-actions toolbar-filters">
+            <input id="device-search" type="search" value="${escapeHtml(state.deviceFilters.keyword)}" placeholder="搜索名称 / 型号 / 区域" />
+            <select id="device-status-filter">
+              <option value="">全部状态</option>
+              <option value="normal"${state.deviceFilters.status === "normal" ? " selected" : ""}>正常</option>
+              <option value="repair"${state.deviceFilters.status === "repair" ? " selected" : ""}>维修中</option>
+              <option value="offline"${state.deviceFilters.status === "offline" ? " selected" : ""}>离线</option>
+            </select>
+            <button class="primary-button" id="device-filter-apply" type="button">筛选</button>
+            <button class="secondary-button" id="device-filter-reset" type="button">重置筛选</button>
+          </div>
+        </div>
+        ${renderTable("devices", ["名称", "型号", "区域", "状态", "图片", "操作"], rows)}
+      </article>
+    </section>
+  `;
+}
+
+function renderAreasPage() {
+  const areasData = state.pageData.areas;
+  if (!areasData) {
+    return renderLoadingPage("区域管理", "管理巡检区域。");
+  }
+  const rows = (areasData.items || []).map((area) => `
+    <tr>
+      <td>${escapeHtml(area.name)}</td>
+      <td>${escapeHtml(area.manager || "-")}</td>
+      <td>${escapeHtml(area.description || "-")}</td>
+      <td>${escapeHtml(formatDateTime(area.createdAt))}</td>
+      <td>
+        <div class="inline-meta">
+          <button class="secondary-button" type="button" data-area-edit data-id="${area.id}">编辑</button>
+          <button class="danger-button" type="button" data-area-delete data-id="${area.id}">删除</button>
+        </div>
+      </td>
+    </tr>
+  `);
+  return `
+    <section class="dual-grid">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>区域配置</h2>
+            <p class="muted">创建设备、点位和路线共用的逻辑区域。</p>
+          </div>
+        </div>
+        <form id="area-form" class="stack-form">
+          <div class="grid-form">
+            <label><span>名称</span><input name="name" required /></label>
+            <label><span>负责人</span><input name="manager" /></label>
+          </div>
+          <label><span>描述</span><textarea name="description" placeholder="区域描述"></textarea></label>
+          <div class="button-row">
+            <button class="primary-button" type="submit">新建区域</button>
+          </div>
+          <p class="form-error" data-form-error="area"></p>
+        </form>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>区域列表</h2>
+            <p class="muted">删除区域后，后端会解除相关关联。</p>
+          </div>
+        </div>
+        ${renderTable("areas", ["名称", "负责人", "描述", "创建时间", "操作"], rows)}
+      </article>
+    </section>
+  `;
+}
+
+function renderPointsPage() {
+  const pointsData = state.pageData.points;
+  if (!pointsData) {
+    return renderLoadingPage("点位管理", "配置巡检点位。");
+  }
+  const rows = (pointsData.items || []).map((point) => `
+    <tr>
+      <td>${escapeHtml(point.name)}</td>
+      <td>${escapeHtml(point.areaName || "-")}</td>
+      <td>${escapeHtml(point.deviceName || "-")}</td>
+      <td>${escapeHtml(formatCoordinate(point.lat))}</td>
+      <td>${escapeHtml(formatCoordinate(point.lng))}</td>
+      <td>${escapeHtml(point.description || "-")}</td>
+      <td>
+        <div class="inline-meta">
+          <button class="secondary-button" type="button" data-point-edit data-id="${point.id}">编辑</button>
+          <button class="danger-button" type="button" data-point-delete data-id="${point.id}">删除</button>
+        </div>
+      </td>
+    </tr>
+  `);
+  return `
+    <section class="dual-grid">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>巡检点位</h2>
+            <p class="muted">每个点位可绑定区域，并可选关联设备。</p>
+          </div>
+        </div>
+        <form id="point-form" class="stack-form">
+          <div class="grid-form">
+            <label><span>名称</span><input name="name" required /></label>
+            <label><span>区域</span>
+              <select name="areaId">${renderSelectOptions(pointsData.areas || [], "", "未设置")}</select>
+            </label>
+            <label><span>设备</span>
+              <select name="deviceId">${renderSelectOptions(pointsData.devices || [], "", "未设置")}</select>
+            </label>
+            <label><span>纬度</span><input name="lat" type="number" step="0.000001" required /></label>
+            <label><span>经度</span><input name="lng" type="number" step="0.000001" required /></label>
+          </div>
+          <label><span>描述</span><textarea name="description" placeholder="点位描述"></textarea></label>
+          <div class="button-row">
+            <button class="primary-button" type="submit">新建点位</button>
+          </div>
+          <p class="form-error" data-form-error="point"></p>
+        </form>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>点位列表</h2>
+            <p class="muted">这些点位可供路线配置复用。</p>
+          </div>
+        </div>
+        ${renderTable("points", ["名称", "区域", "设备", "纬度", "经度", "描述", "操作"], rows)}
+      </article>
+    </section>
+  `;
+}
+
+function renderRoutesPage() {
+  const routesData = state.pageData.routes;
+  if (!routesData) {
+    return renderLoadingPage("路线管理", "由巡检点位组成巡检路线。");
+  }
+  const activeRoute = (routesData.items || []).find((route) => Number(route.id) === Number(state.routeEditor.routeId)) || null;
+  const activePointIds = new Set((state.routeEditor.selected || []).map((value) => Number(value)));
+  const activeRoutePoints = activeRoute ? (routesData.routePoints?.[activeRoute.id] || []) : [];
+  const pointsById = new Map((routesData.points || []).map((point) => [Number(point.id), point]));
+  const selectedPoints = (state.routeEditor.selected || []).map((id) => pointsById.get(Number(id))).filter(Boolean);
+  const availablePoints = (routesData.points || []).filter((point) => !activePointIds.has(Number(point.id)));
+  const rows = (routesData.items || []).map((route) => `
+    <tr>
+      <td>${escapeHtml(route.name)}</td>
+      <td>${escapeHtml(route.areaName || "-")}</td>
+      <td>${escapeHtml(route.description || "-")}</td>
+      <td>${escapeHtml(String(route.pointCount || 0))}</td>
+      <td>${escapeHtml(formatDateTime(route.createdAt))}</td>
+      <td>
+        <div class="inline-meta">
+          <button class="secondary-button" type="button" data-route-edit data-id="${route.id}">编辑</button>
+          <button class="ghost-button" type="button" data-route-manage data-id="${route.id}">
+            ${activeRoute && activeRoute.id === route.id ? "收起点位" : "配置点位"}
+          </button>
+          <button class="danger-button" type="button" data-route-delete data-id="${route.id}">删除</button>
+        </div>
+      </td>
+    </tr>
+  `);
+  const editorHtml = activeRoute ? `
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>路线点位</h2>
+          <p class="muted">${escapeHtml(activeRoute.name)} 当前已绑定 ${activeRoutePoints.length} 个点位。</p>
+        </div>
+        <span class="pill">已选 ${state.routeEditor.selected.length}</span>
+      </div>
+      <div class="route-transfer">
+        <div class="transfer-panel">
+          <strong>待选点位</strong>
+          <select id="route-available-points" class="transfer-select" multiple size="12">
+            ${availablePoints.map((point) => `
+              <option value="${point.id}">
+                ${escapeHtml(`${point.name} ｜ ${point.areaName || "-"} ｜ ${formatCoordinate(point.lat)}, ${formatCoordinate(point.lng)}`)}
+              </option>
+            `).join("")}
+          </select>
+          <p class="muted">左侧展示还未加入该路线的巡检点。</p>
+        </div>
+        <div class="transfer-actions">
+          <button class="secondary-button" id="route-points-add" type="button">加入 →</button>
+          <button class="secondary-button" id="route-points-remove" type="button">← 移出</button>
+          <button class="ghost-button" id="route-points-up" type="button">上移</button>
+          <button class="ghost-button" id="route-points-down" type="button">下移</button>
+        </div>
+        <div class="transfer-panel">
+          <strong>路线顺序</strong>
+          <select id="route-selected-points" class="transfer-select" multiple size="12">
+            ${selectedPoints.map((point, index) => `
+              <option value="${point.id}">
+                ${escapeHtml(`${index + 1}. ${point.name} ｜ ${point.areaName || "-"} ｜ ${formatCoordinate(point.lat)}, ${formatCoordinate(point.lng)}`)}
+              </option>
+            `).join("")}
+          </select>
+          <p class="muted">右侧顺序即保存后的巡检顺序。</p>
+        </div>
+      </div>
+      <div class="button-row">
+        <button class="primary-button" id="route-points-save" type="button">保存点位配置</button>
+        <button class="secondary-button" id="route-points-close" type="button">关闭</button>
+      </div>
+      <p class="form-error" data-form-error="route-points"></p>
+    </article>
+  ` : "";
+  return `
+    <section class="dual-grid">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>巡检路线</h2>
+            <p class="muted">创建巡检路线并绑定所属区域。</p>
+          </div>
+        </div>
+        <form id="route-form" class="stack-form">
+          <div class="grid-form">
+            <label><span>名称</span><input name="name" required /></label>
+            <label><span>区域</span>
+              <select name="areaId">${renderSelectOptions(routesData.areas || [], "", "未设置")}</select>
+            </label>
+          </div>
+          <label><span>描述</span><textarea name="description" placeholder="路线描述"></textarea></label>
+          <div class="button-row">
+            <button class="primary-button" type="submit">新建路线</button>
+          </div>
+          <p class="form-error" data-form-error="route"></p>
+        </form>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>路线列表</h2>
+            <p class="muted">点击“配置点位”设置路线点位。</p>
+          </div>
+        </div>
+        ${renderTable("routes", ["名称", "区域", "描述", "点位数", "创建时间", "操作"], rows)}
+      </article>
+    </section>
+    ${editorHtml}
+  `;
+}
+
+function bindUsersPage() {
+  if (!state.pageData.users) {
+    void ensureManagementPageData("users");
+    return;
+  }
+  document.querySelector("[data-user-create]")?.addEventListener("click", () => {
+    showCrudModal({
+      title: "新增用户",
+      saveText: "创建用户",
+      fields: [
+        { name: "username", label: "用户名", required: true },
+        { name: "displayName", label: "显示名称" },
+        { name: "password", label: "密码", type: "password", required: true },
+      ],
+      onSubmit: async (payload) => {
+        await apiFetch("/api/users", { method: "POST", body: JSON.stringify(payload) });
+        await ensureManagementPageData("users", true);
+      },
+    });
+  });
+  document.querySelectorAll("[data-user-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const user = findPageItem("users", button.dataset.id);
+      if (!user) return;
+      showCrudModal({
+        title: `编辑用户：${user.username}`,
+        saveText: "保存修改",
+        values: {
+          displayName: user.displayName || user.username,
+          password: "",
+        },
+        fields: [
+          { name: "displayName", label: "显示名称", required: true },
+          { name: "password", label: "新密码", type: "password", placeholder: "留空则保持不变" },
+        ],
+        onSubmit: async (payload) => {
+          if (!payload.displayName && !payload.password) {
+            throw new Error("请至少填写显示名称或新密码。");
+          }
+          await apiFetch(`/api/users/${user.id}`, { method: "PUT", body: JSON.stringify(payload) });
+          await ensureManagementPageData("users", true);
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-user-toggle]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await apiFetch(`/api/users/${button.dataset.id}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: button.dataset.nextStatus }),
+      });
+      await ensureManagementPageData("users", true);
+    });
+  });
+}
+
+function bindDevicesPage() {
+  if (!state.pageData.devices) {
+    void ensureManagementPageData("devices");
+    return;
+  }
+  bindManagedForm("device-form", "device", async (form) => {
+    const payload = numericPayload(formToObject(form), ["areaId"]);
+    const created = await apiFetch("/api/devices", { method: "POST", body: JSON.stringify(payload) });
+    if (state.deviceImageDraft.file && created.deviceId) {
+      const formData = new FormData();
+      formData.append("file", state.deviceImageDraft.file);
+      await apiUpload(`/api/devices/${created.deviceId}/image`, formData);
+    }
+    form.reset();
+    clearDeviceImageDraft();
+    await ensureManagementPageData("devices", true);
+  });
+  document.getElementById("device-image-input")?.addEventListener("change", (event) => {
+    const [file] = event.target.files || [];
+    setDeviceImageDraft(file || null);
+    renderCurrentPage();
+  });
+  document.getElementById("device-image-clear")?.addEventListener("click", () => {
+    clearDeviceImageDraft();
+    renderCurrentPage();
+  });
+  document.getElementById("device-filter-apply")?.addEventListener("click", () => {
+    state.deviceFilters.keyword = document.getElementById("device-search")?.value || "";
+    state.deviceFilters.status = document.getElementById("device-status-filter")?.value || "";
+    renderCurrentPage();
+  });
+  document.getElementById("device-filter-reset")?.addEventListener("click", () => {
+    state.deviceFilters = { keyword: "", status: "" };
+    renderCurrentPage();
+  });
+  document.querySelectorAll("[data-device-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const device = findPageItem("devices", button.dataset.id);
+      if (!device) return;
+      showCrudModal({
+        title: `编辑设备：${device.name}`,
+        saveText: "保存设备",
+        values: {
+          name: device.name,
+          model: device.model,
+          status: device.status || "normal",
+          areaId: device.areaId == null ? "" : String(device.areaId),
+          notes: device.notes || "",
+        },
+        fields: [
+          { name: "name", label: "名称", required: true },
+          { name: "model", label: "型号", required: true },
+          {
+            name: "status",
+            label: "状态",
+            type: "select",
+            options: [
+              { value: "normal", label: "正常" },
+              { value: "repair", label: "维修中" },
+              { value: "offline", label: "离线" },
+            ],
+          },
+          {
+            name: "areaId",
+            label: "区域",
+            type: "select",
+            options: [{ value: "", label: "未设置" }].concat(
+              (state.pageData.devices?.areas || []).map((area) => ({ value: String(area.id), label: area.name })),
+            ),
+          },
+          { name: "notes", label: "备注", type: "textarea", className: "field-span-2" },
+        ],
+        onSubmit: async (payload) => {
+          const nextPayload = numericPayload(payload, ["areaId"]);
+          await apiFetch(`/api/devices/${device.id}`, { method: "PUT", body: JSON.stringify(nextPayload) });
+          await ensureManagementPageData("devices", true);
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-device-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该设备？")) return;
+      await apiFetch(`/api/devices/${button.dataset.id}`, { method: "DELETE" });
+      await ensureManagementPageData("devices", true);
+    });
+  });
+}
+
+function bindAreasPage() {
+  if (!state.pageData.areas) {
+    void ensureManagementPageData("areas");
+    return;
+  }
+  bindManagedForm("area-form", "area", async (form) => {
+    await apiFetch("/api/areas", { method: "POST", body: JSON.stringify(formToObject(form)) });
+    form.reset();
+    await ensureManagementPageData("areas", true);
+  });
+  document.querySelectorAll("[data-area-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const area = findPageItem("areas", button.dataset.id);
+      if (!area) return;
+      showCrudModal({
+        title: `编辑区域：${area.name}`,
+        saveText: "保存区域",
+        values: {
+          name: area.name,
+          manager: area.manager || "",
+          description: area.description || "",
+        },
+        fields: [
+          { name: "name", label: "名称", required: true },
+          { name: "manager", label: "负责人" },
+          { name: "description", label: "描述", type: "textarea", className: "field-span-2" },
+        ],
+        onSubmit: async (payload) => {
+          await apiFetch(`/api/areas/${area.id}`, {
+            method: "PUT",
+            body: JSON.stringify(payload),
+          });
+          await ensureManagementPageData("areas", true);
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-area-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该区域？")) return;
+      await apiFetch(`/api/areas/${button.dataset.id}`, { method: "DELETE" });
+      await ensureManagementPageData("areas", true);
+    });
+  });
+}
+
+function bindPointsPage() {
+  if (!state.pageData.points) {
+    void ensureManagementPageData("points");
+    return;
+  }
+  bindManagedForm("point-form", "point", async (form) => {
+    const payload = numericPayload(formToObject(form), ["areaId", "deviceId", "lat", "lng"]);
+    await apiFetch("/api/points", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    await ensureManagementPageData("points", true);
+  });
+  document.querySelectorAll("[data-point-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const point = findPageItem("points", button.dataset.id);
+      if (!point) return;
+      showCrudModal({
+        title: `编辑点位：${point.name}`,
+        saveText: "保存点位",
+        values: {
+          name: point.name,
+          areaId: point.areaId == null ? "" : String(point.areaId),
+          deviceId: point.deviceId == null ? "" : String(point.deviceId),
+          lat: String(point.lat ?? ""),
+          lng: String(point.lng ?? ""),
+          description: point.description || "",
+        },
+        fields: [
+          { name: "name", label: "名称", required: true },
+          {
+            name: "areaId",
+            label: "区域",
+            type: "select",
+            options: [{ value: "", label: "未设置" }].concat(
+              (state.pageData.points?.areas || []).map((area) => ({ value: String(area.id), label: area.name })),
+            ),
+          },
+          {
+            name: "deviceId",
+            label: "设备",
+            type: "select",
+            options: [{ value: "", label: "未设置" }].concat(
+              (state.pageData.points?.devices || []).map((device) => ({ value: String(device.id), label: device.name })),
+            ),
+          },
+          { name: "lat", label: "纬度", type: "number", step: "0.000001", required: true },
+          { name: "lng", label: "经度", type: "number", step: "0.000001", required: true },
+          { name: "description", label: "描述", type: "textarea", className: "field-span-2" },
+        ],
+        onSubmit: async (payload) => {
+          const nextPayload = numericPayload(payload, ["areaId", "deviceId", "lat", "lng"]);
+          await apiFetch(`/api/points/${point.id}`, { method: "PUT", body: JSON.stringify(nextPayload) });
+          await ensureManagementPageData("points", true);
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-point-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该点位？")) return;
+      await apiFetch(`/api/points/${button.dataset.id}`, { method: "DELETE" });
+      await ensureManagementPageData("points", true);
+    });
+  });
+}
+
+function bindRoutesPage() {
+  if (!state.pageData.routes) {
+    void ensureManagementPageData("routes");
+    return;
+  }
+  bindManagedForm("route-form", "route", async (form) => {
+    const payload = numericPayload(formToObject(form), ["areaId"]);
+    await apiFetch("/api/routes", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    await ensureManagementPageData("routes", true);
+  });
+  document.querySelectorAll("[data-route-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const route = findPageItem("routes", button.dataset.id);
+      if (!route) return;
+      showCrudModal({
+        title: `编辑路线：${route.name}`,
+        saveText: "保存路线",
+        values: {
+          name: route.name,
+          areaId: route.areaId == null ? "" : String(route.areaId),
+          description: route.description || "",
+        },
+        fields: [
+          { name: "name", label: "名称", required: true },
+          {
+            name: "areaId",
+            label: "区域",
+            type: "select",
+            options: [{ value: "", label: "未设置" }].concat(
+              (state.pageData.routes?.areas || []).map((area) => ({ value: String(area.id), label: area.name })),
+            ),
+          },
+          { name: "description", label: "描述", type: "textarea", className: "field-span-2" },
+        ],
+        onSubmit: async (payload) => {
+          const nextPayload = numericPayload(payload, ["areaId"]);
+          await apiFetch(`/api/routes/${route.id}`, { method: "PUT", body: JSON.stringify(nextPayload) });
+          await ensureManagementPageData("routes", true);
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-route-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该路线？")) return;
+      await apiFetch(`/api/routes/${button.dataset.id}`, { method: "DELETE" });
+      if (Number(state.routeEditor.routeId) === Number(button.dataset.id)) {
+        state.routeEditor = { routeId: null, selected: [] };
+      }
+      await ensureManagementPageData("routes", true);
+    });
+  });
+  document.querySelectorAll("[data-route-manage]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const routeId = Number(button.dataset.id);
+      if (Number(state.routeEditor.routeId) === routeId) {
+        state.routeEditor = { routeId: null, selected: [] };
+        renderCurrentPage();
+        return;
+      }
+      state.routeEditor.routeId = routeId;
+      state.routeEditor.selected = [];
+      await ensureRoutePoints(routeId, true);
+    });
+  });
+  document.getElementById("route-points-add")?.addEventListener("click", () => {
+    const availableSelect = document.getElementById("route-available-points");
+    const ids = Array.from(availableSelect?.selectedOptions || []).map((option) => Number(option.value));
+    if (!ids.length) return;
+    state.routeEditor.selected = [...state.routeEditor.selected, ...ids.filter((id) => !state.routeEditor.selected.includes(id))];
+    renderCurrentPage();
+  });
+  document.getElementById("route-points-remove")?.addEventListener("click", () => {
+    const selectedSelect = document.getElementById("route-selected-points");
+    const ids = new Set(Array.from(selectedSelect?.selectedOptions || []).map((option) => Number(option.value)));
+    if (!ids.size) return;
+    state.routeEditor.selected = state.routeEditor.selected.filter((id) => !ids.has(Number(id)));
+    renderCurrentPage();
+  });
+  document.getElementById("route-points-up")?.addEventListener("click", () => {
+    const selectedSelect = document.getElementById("route-selected-points");
+    const ids = new Set(Array.from(selectedSelect?.selectedOptions || []).map((option) => Number(option.value)));
+    if (!ids.size) return;
+    for (let index = 1; index < state.routeEditor.selected.length; index += 1) {
+      const currentId = Number(state.routeEditor.selected[index]);
+      const previousId = Number(state.routeEditor.selected[index - 1]);
+      if (ids.has(currentId) && !ids.has(previousId)) {
+        [state.routeEditor.selected[index - 1], state.routeEditor.selected[index]] = [state.routeEditor.selected[index], state.routeEditor.selected[index - 1]];
+      }
+    }
+    renderCurrentPage();
+  });
+  document.getElementById("route-points-down")?.addEventListener("click", () => {
+    const selectedSelect = document.getElementById("route-selected-points");
+    const ids = new Set(Array.from(selectedSelect?.selectedOptions || []).map((option) => Number(option.value)));
+    if (!ids.size) return;
+    for (let index = state.routeEditor.selected.length - 2; index >= 0; index -= 1) {
+      const currentId = Number(state.routeEditor.selected[index]);
+      const nextId = Number(state.routeEditor.selected[index + 1]);
+      if (ids.has(currentId) && !ids.has(nextId)) {
+        [state.routeEditor.selected[index + 1], state.routeEditor.selected[index]] = [state.routeEditor.selected[index], state.routeEditor.selected[index + 1]];
+      }
+    }
+    renderCurrentPage();
+  });
+  document.getElementById("route-points-save")?.addEventListener("click", async () => {
+    if (!state.routeEditor.routeId) return;
+    setFormError("route-points");
+    try {
+      await apiFetch(`/api/routes/${state.routeEditor.routeId}/points`, {
+        method: "PUT",
+        body: JSON.stringify({ pointIds: state.routeEditor.selected }),
+      });
+      await ensureManagementPageData("routes", true);
+      await ensureRoutePoints(state.routeEditor.routeId, true);
+    } catch (error) {
+      setFormError("route-points", error.message);
+    }
+  });
+  document.getElementById("route-points-close")?.addEventListener("click", () => {
+    state.routeEditor = { routeId: null, selected: [] };
+    renderCurrentPage();
+  });
+}
+
 function renderTable(type, headers, rows) {
   return rows.length ? `
     <div class="table-scroll">
@@ -809,8 +1848,14 @@ function renderCurrentPage() {
     status: renderStatusPage,
     maintenance: renderMaintenancePage,
     zones: renderZonesPage,
+    users: renderUsersPage,
+    devices: renderDevicesPage,
+    areas: renderAreasPage,
+    points: renderPointsPage,
+    routes: renderRoutesPage,
   };
-  pageContent.innerHTML = renderers[state.pageId]();
+  const renderer = renderers[state.pageId];
+  pageContent.innerHTML = renderer ? renderer() : `<section class="panel"><div class="empty-state">页面不存在。</div></section>`;
   bindForms();
   renderMaps();
 }
@@ -899,6 +1944,11 @@ function bindForms() {
   });
   bindZoneTools();
   bindDeleteButtons();
+  if (state.pageId === "users") bindUsersPage();
+  if (state.pageId === "devices") bindDevicesPage();
+  if (state.pageId === "areas") bindAreasPage();
+  if (state.pageId === "points") bindPointsPage();
+  if (state.pageId === "routes") bindRoutesPage();
 }
 
 function numericPayload(payload, keys) {

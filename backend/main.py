@@ -215,6 +215,19 @@ def execute_write(sql: str, params: tuple[Any, ...] | None = None) -> int:
         connection.close()
 
 
+def execute_insert(sql: str, params: tuple[Any, ...] | None = None) -> int:
+    ensure_mysql_configured()
+    connection = get_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            inserted_id = int(cursor.lastrowid or 0)
+        connection.commit()
+        return inserted_id
+    finally:
+        connection.close()
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
@@ -1383,7 +1396,7 @@ async def api_create_device(request: Request) -> JSONResponse:
     area_id = payload.get("areaId")
     if area_id is not None:
         area_id = parse_strict_id(area_id, "areaId")
-    execute_write(
+    device_id = execute_insert(
         "INSERT INTO devices (name, model, image_path, status, area_id, notes, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (
             name, model, str(payload.get("imagePath", "")),
@@ -1391,7 +1404,7 @@ async def api_create_device(request: Request) -> JSONResponse:
             area_id, str(payload.get("notes", "")).strip(), datetime.now(),
         ),
     )
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "deviceId": device_id})
 
 
 @app.put("/api/devices/{device_id}")
