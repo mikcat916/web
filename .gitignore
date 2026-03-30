@@ -50,3 +50,13 @@ Thumbs.db
 
 # Office temp lock files
 ~$*
+
+# Local runtime outputs
+.pydeps/
+logs/
+backend/static/uploads/
+pytest-cache-files-*/
+backend/pytest-cache-files-*/
+
+# Tooling
+.ppt-tools/node_modules/
