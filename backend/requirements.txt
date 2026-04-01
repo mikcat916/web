@@ -6,3 +6,5 @@ jinja2
 itsdangerous
 pytest
 httpx
+python-multipart
+websockets

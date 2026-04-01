@@ -21,8 +21,23 @@ const state = {
   maps: {},
   pageData: {},
   routeEditor: { routeId: null, selected: [] },
+  pointDraft: {
+    coords: null,
+    zoneId: null,
+    zoneName: "",
+    marker: null,
+  },
   deviceFilters: { keyword: "", status: "" },
   deviceImageDraft: { file: null, previewUrl: "", fileName: "" },
+  robotDiscovery: {
+    items: [],
+    scannedAt: "",
+    expiresAt: "",
+    subnets: [],
+    loading: false,
+    error: "",
+    selectedIp: "",
+  },
   modal: { onSubmit: null },
   zoneDraft: {
     path: [],
@@ -30,13 +45,19 @@ const state = {
     fillColor: "rgba(13, 185, 242, 0.18)",
     complete: false,
     clickTimer: null,
+    pendingPoint: null,
   },
   geo: {
     coords: null,
     promise: null,
     status: "idle",
     watchId: null,
-    locationText: null,
+      locationText: null,
+  },
+  realtime: {
+    socket: null,
+    heartbeatTimer: null,
+    reconnectTimer: null,
   },
 };
 
@@ -46,6 +67,7 @@ const TOKEN_TEXT = {
   critical: "严重",
   disabled: "已停用",
   degraded: "性能下降",
+  fault: "故障",
   good: "良好",
   healthy: "正常",
   high: "高",
@@ -97,6 +119,23 @@ function localizeToken(value) {
   return TOKEN_TEXT[token] || String(value || "-");
 }
 
+function formatRobotLocation(robot) {
+  const location = Array.isArray(robot?.location) ? robot.location : [];
+  if (location.length !== 2) return "-";
+  const [lng, lat] = location;
+  return `${formatCoordinate(lat)}, ${formatCoordinate(lng)}`;
+}
+
+function describeRobotNetwork(robot) {
+  const status = localizeToken(robot.networkStatus || robot.telemetryStatus || "offline");
+  const signal = Number.isFinite(Number(robot.signal)) ? `${robot.signal}%` : "-";
+  return `${status} · 信号 ${signal}`;
+}
+
+function robotMarkerTitle(robot) {
+  return `${robot.model} | ${localizeToken(robot.status)} | 网络 ${localizeToken(robot.networkStatus)} | 电量 ${robot.battery}%`;
+}
+
 function toRgba(hex, alpha = 0.18) {
   const normalized = String(hex || "").replace("#", "");
   if (normalized.length !== 6) return `rgba(13, 185, 242, ${alpha})`;
@@ -111,6 +150,7 @@ function resetZoneDraft() {
     window.clearTimeout(state.zoneDraft.clickTimer);
     state.zoneDraft.clickTimer = null;
   }
+  state.zoneDraft.pendingPoint = null;
   state.zoneDraft.path = [];
   state.zoneDraft.complete = false;
   syncZoneDraftUi();
@@ -170,6 +210,7 @@ function refreshZoneDraftPreview() {
       strokeColor: state.zoneDraft.strokeColor,
       strokeWeight: 3,
       strokeStyle: state.zoneDraft.complete ? "solid" : "dashed",
+      bubble: true,
     });
   }
   if (path.length >= 3) {
@@ -180,6 +221,7 @@ function refreshZoneDraftPreview() {
       fillColor: state.zoneDraft.fillColor,
       fillOpacity: state.zoneDraft.complete ? 0.28 : 0.16,
       strokeWeight: 2,
+      bubble: true,
     });
   }
 }
@@ -188,13 +230,38 @@ function queueZonePoint(coords) {
   if (state.zoneDraft.clickTimer) {
     window.clearTimeout(state.zoneDraft.clickTimer);
   }
+  state.zoneDraft.pendingPoint = coords;
   state.zoneDraft.clickTimer = window.setTimeout(() => {
-    state.zoneDraft.path = [...state.zoneDraft.path, coords];
-    state.zoneDraft.complete = false;
-    state.zoneDraft.clickTimer = null;
-    syncZoneDraftUi();
-    refreshZoneDraftPreview();
+    commitPendingZonePoint();
   }, 220);
+}
+
+function commitPendingZonePoint() {
+  if (!state.zoneDraft.pendingPoint) return false;
+  const lastPoint = state.zoneDraft.path[state.zoneDraft.path.length - 1] || null;
+  const isDuplicatePoint = lastPoint
+    && Math.abs(lastPoint[0] - state.zoneDraft.pendingPoint[0]) < 1e-6
+    && Math.abs(lastPoint[1] - state.zoneDraft.pendingPoint[1]) < 1e-6;
+  if (!isDuplicatePoint) {
+    state.zoneDraft.path = [...state.zoneDraft.path, state.zoneDraft.pendingPoint];
+  }
+  state.zoneDraft.pendingPoint = null;
+  state.zoneDraft.complete = false;
+  if (state.zoneDraft.clickTimer) {
+    window.clearTimeout(state.zoneDraft.clickTimer);
+    state.zoneDraft.clickTimer = null;
+  }
+  syncZoneDraftUi();
+  refreshZoneDraftPreview();
+  return true;
+}
+
+function clearPendingZonePoint() {
+  if (state.zoneDraft.clickTimer) {
+    window.clearTimeout(state.zoneDraft.clickTimer);
+    state.zoneDraft.clickTimer = null;
+  }
+  state.zoneDraft.pendingPoint = null;
 }
 
 function setupZoneDrawing(map) {
@@ -205,10 +272,7 @@ function setupZoneDrawing(map) {
     queueZonePoint([event.lnglat.getLng(), event.lnglat.getLat()]);
   });
   map.on("dblclick", () => {
-    if (state.zoneDraft.clickTimer) {
-      window.clearTimeout(state.zoneDraft.clickTimer);
-      state.zoneDraft.clickTimer = null;
-    }
+    commitPendingZonePoint();
     if (state.zoneDraft.path.length >= 3) {
       state.zoneDraft.complete = true;
       syncZoneDraftUi();
@@ -216,9 +280,11 @@ function setupZoneDrawing(map) {
     }
   });
   map.on("rightclick", () => {
-    if (state.zoneDraft.clickTimer) {
-      window.clearTimeout(state.zoneDraft.clickTimer);
-      state.zoneDraft.clickTimer = null;
+    if (state.zoneDraft.pendingPoint) {
+      clearPendingZonePoint();
+      syncZoneDraftUi();
+      refreshZoneDraftPreview();
+      return;
     }
     if (!state.zoneDraft.path.length) return;
     state.zoneDraft.path = state.zoneDraft.path.slice(0, -1);
@@ -491,6 +557,7 @@ function refreshMapsWithLocation() {
         position: coords,
         title: "我的当前位置",
         label: { content: "我", direction: "top" },
+        bubble: true,
       });
     } else {
       entry.userMarker.setPosition(coords);
@@ -534,14 +601,16 @@ function renderOverviewPage() {
             <div class="list-item">
               <div>
                 <strong>${escapeHtml(robot.model)}</strong>
-                <p>${escapeHtml(robot.zoneName)} · ${formatDateTime(robot.createdAt)}</p>
+                <p>${escapeHtml(robot.zoneName)} · 最近上报 ${escapeHtml(formatDateTime(robot.lastSeenAt || robot.createdAt))}</p>
                 <div class="inline-meta">
                   <span class="${pillClass(robot.status)}">${escapeHtml(localizeToken(robot.status))}</span>
+                  <span class="${pillClass(robot.networkStatus)}">网络 ${escapeHtml(localizeToken(robot.networkStatus))}</span>
                   <span class="meta-pill">电量 ${robot.battery}%</span>
+                  <span class="meta-pill">信号 ${robot.signal}%</span>
                   <span class="meta-pill">健康度 ${robot.health}%</span>
                 </div>
               </div>
-              <div class="muted">速度 ${robot.speed} m/s</div>
+              <div class="muted">位置 ${escapeHtml(formatRobotLocation(robot))} · 速度 ${robot.speed} m/s</div>
             </div>
           `).join("") : `<div class="empty-state">暂无机器人数据。</div>`}
         </div>
@@ -670,14 +739,36 @@ function renderReportsPage() {
 }
 
 function renderStatusPage() {
+  const discovery = state.robotDiscovery;
+  const confirmedItems = discovery.items.filter((item) => item.confirmed);
+  const selectedIp = confirmedItems.some((item) => item.ipAddress === discovery.selectedIp)
+    ? discovery.selectedIp
+    : "";
+  const submitDisabled = !selectedIp || discovery.loading;
   return `
     ${renderStats()}
     <section class="dual-grid">
       <article class="panel">
-        <div class="panel-header"><div><h2>新增机器人</h2><p class="muted">将机器人注册到当前车队</p></div></div>
+        <div class="panel-header"><div><h2>新增机器人</h2><p class="muted">必须先扫描当前 Wi-Fi 网络并确认机器人实体</p></div></div>
         <form id="robot-form" class="stack-form">
           <div class="grid-form">
             <label><span>名称</span><input name="model" placeholder="例：巡检机器人-01" required></label>
+            <label class="field-span-2">
+              <span>Wi-Fi 扫描确认</span>
+              <div class="inline-meta robot-discovery-toolbar">
+                <button class="secondary-button" id="robot-discovery-refresh" type="button"${discovery.loading ? " disabled" : ""}>${discovery.loading ? "扫描中..." : "扫描 Wi-Fi 网络"}</button>
+                <span class="muted">${discovery.scannedAt ? `最近扫描：${escapeHtml(formatDateTime(discovery.scannedAt))}` : "尚未扫描"}</span>
+              </div>
+              <select id="robot-discovery-select" name="ipAddress" required${discovery.loading ? " disabled" : ""}>
+                <option value="">请先扫描并选择已确认的机器人 IP</option>
+                ${confirmedItems.map((item) => `
+                  <option value="${escapeHtml(item.ipAddress)}"${item.ipAddress === selectedIp ? " selected" : ""}>
+                    ${escapeHtml(item.ipAddress)} | ${escapeHtml(item.deviceName || item.hostName || "unknown")} | ${escapeHtml(item.summary || "")}
+                  </option>
+                `).join("")}
+              </select>
+              <small class="muted">${discovery.subnets?.length ? `扫描网段：${escapeHtml(discovery.subnets.join(", "))}` : "仅允许添加当前 Wi-Fi 网络中已识别的机器人。"}</small>
+            </label>
             <label><span>区域 ID</span><input name="zoneId" type="number"></label>
             <label><span>状态</span><select name="status"><option value="idle">待命</option><option value="active">执行中</option><option value="charging">充电中</option><option value="offline">离线</option></select></label>
             <label><span>健康度</span><input name="health" type="number" value="92" min="0" max="100"></label>
@@ -689,21 +780,43 @@ function renderStatusPage() {
             <label><span>纬度</span><input name="lat" type="number" step="0.000001" value="31.09161"></label>
             <label><span>航向角</span><input name="heading" type="number" value="0" min="0" max="359"></label>
           </div>
-          <div class="button-row"><button class="primary-button" type="submit">添加机器人</button></div>
+          ${discovery.error ? `<div class="form-error">${escapeHtml(discovery.error)}</div>` : ""}
+          <div class="button-row"><button class="primary-button" type="submit"${submitDisabled ? " disabled" : ""}>添加机器人</button></div>
           <p class="form-error" data-form-error="robot"></p>
         </form>
+        <div class="list-stack robot-discovery-list">
+          ${discovery.items.length ? discovery.items.map((item) => `
+            <div class="list-item robot-discovery-item${item.confirmed ? " confirmed" : ""}">
+              <div>
+                <strong>${escapeHtml(item.ipAddress)}</strong>
+                <p>${escapeHtml(item.deviceName || item.hostName || "unknown host")} | MAC ${escapeHtml(item.macAddress || "-")}</p>
+              </div>
+              <div>
+                <span class="${item.confirmed ? "pill healthy" : "pill warning"}">${item.confirmed ? "已确认" : "未确认"}</span>
+                <p class="muted">ports: ${escapeHtml(formatPorts(item.openPorts))}</p>
+              </div>
+            </div>
+          `).join("") : `<div class="empty-state">还没有扫描结果。</div>`}
+        </div>
       </article>
       <article class="panel">
         <div class="panel-header"><div><h2>机器人状态板</h2><p class="muted">遥测与运行状态</p></div></div>
-        ${renderTable("robots", ["ID", "机器人名称", "区域", "状态", "电量", "健康度", "信号", "操作"], state.data.robots.map((robot) => `
+        ${renderTable("robots", ["ID", "机器人名称", "IP", "区域", "运行状态", "网络", "电量", "位置", "最近上报", "操作"], state.data.robots.map((robot) => `
           <tr>
             <td>${robot.id}</td>
             <td>${escapeHtml(robot.model)}</td>
+            <td>${escapeHtml(robot.ipAddress || "-")}</td>
             <td>${escapeHtml(robot.zoneName)}</td>
             <td><span class="${pillClass(robot.status)}">${escapeHtml(localizeToken(robot.status))}</span></td>
+            <td>
+              <div class="inline-meta">
+                <span class="${pillClass(robot.networkStatus)}">${escapeHtml(localizeToken(robot.networkStatus))}</span>
+                <span class="muted">信号 ${robot.signal}%</span>
+              </div>
+            </td>
             <td>${robot.battery}%</td>
-            <td>${robot.health}%</td>
-            <td>${robot.signal}%</td>
+            <td>${escapeHtml(formatRobotLocation(robot))}</td>
+            <td>${escapeHtml(formatDateTime(robot.lastSeenAt || robot.createdAt))}</td>
             <td><button class="danger-button" data-delete="robots" data-id="${robot.id}">删除</button></td>
           </tr>
         `))}
@@ -795,6 +908,10 @@ function renderZonesPage() {
               <div>
                 <span class="${pillClass(zone.risk)}">${escapeHtml(localizeToken(zone.risk))}</span>
                 <p class="muted">${escapeHtml(zone.frequency)}</p>
+                <div class="inline-meta">
+                  <button class="secondary-button" type="button" data-zone-edit data-id="${zone.id}">编辑</button>
+                  <button class="danger-button" type="button" data-zone-delete data-id="${zone.id}">删除</button>
+                </div>
               </div>
             </div>
           `).join("") : `<div class="empty-state">暂无区域配置。</div>`}
@@ -837,6 +954,107 @@ function renderSelectOptions(items, selectedValue = "", emptyLabel = "未设置"
 function formatCoordinate(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(6) : "-";
+}
+
+function formatPorts(value) {
+  return Array.isArray(value) && value.length ? value.join(", ") : "-";
+}
+
+async function fetchRobotDiscovery(refresh = false) {
+  state.robotDiscovery.loading = true;
+  state.robotDiscovery.error = "";
+  if (state.pageId === "status") {
+    renderCurrentPage();
+  }
+  try {
+    const query = refresh ? "?refresh=1" : "";
+    const payload = await apiFetch(`/api/robots/discovery${query}`);
+    state.robotDiscovery.items = payload.items || [];
+    state.robotDiscovery.scannedAt = payload.scannedAt || "";
+    state.robotDiscovery.expiresAt = payload.expiresAt || "";
+    state.robotDiscovery.subnets = payload.subnets || [];
+    if (!state.robotDiscovery.items.some((item) => item.confirmed && item.ipAddress === state.robotDiscovery.selectedIp)) {
+      state.robotDiscovery.selectedIp = "";
+    }
+  } catch (error) {
+    state.robotDiscovery.error = error.message;
+  } finally {
+    state.robotDiscovery.loading = false;
+    if (state.pageId === "status") {
+      renderCurrentPage();
+    }
+  }
+}
+
+function pointInPolygon(coords, polygon) {
+  const [lng, lat] = coords;
+  let inside = false;
+  for (let current = 0, previous = polygon.length - 1; current < polygon.length; previous = current, current += 1) {
+    const [currentLng, currentLat] = polygon[current];
+    const [previousLng, previousLat] = polygon[previous];
+    const intersects = ((currentLat > lat) !== (previousLat > lat))
+      && (lng < ((previousLng - currentLng) * (lat - currentLat)) / ((previousLat - currentLat) || 1e-12) + currentLng);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function resolveZoneForPoint(coords) {
+  return (state.data?.zones || []).find((zone) => pointInPolygon(coords, zone.path)) || null;
+}
+
+function syncPointDraftUi() {
+  const form = document.getElementById("point-form");
+  const status = document.getElementById("point-picker-status");
+  if (!form) return;
+  const latField = form.elements.namedItem("lat");
+  const lngField = form.elements.namedItem("lng");
+  if (latField) latField.value = state.pointDraft.coords ? state.pointDraft.coords[1].toFixed(6) : "";
+  if (lngField) lngField.value = state.pointDraft.coords ? state.pointDraft.coords[0].toFixed(6) : "";
+  if (status) {
+    status.textContent = state.pointDraft.coords
+      ? `已选择 ${state.pointDraft.zoneName} 内的巡检点：${state.pointDraft.coords[1].toFixed(6)}, ${state.pointDraft.coords[0].toFixed(6)}`
+      : "请在地图中的巡检区域内点击选择巡检点。";
+  }
+}
+
+function resetPointDraft() {
+  state.pointDraft.coords = null;
+  state.pointDraft.zoneId = null;
+  state.pointDraft.zoneName = "";
+  if (state.pointDraft.marker) {
+    state.pointDraft.marker.setMap(null);
+    state.pointDraft.marker = null;
+  }
+  syncPointDraftUi();
+}
+
+function setupPointPicker(map) {
+  syncPointDraftUi();
+  map.on("click", (event) => {
+    const coords = [event.lnglat.getLng(), event.lnglat.getLat()];
+    const zone = resolveZoneForPoint(coords);
+    if (!zone) {
+      setFormError("point", "请在巡检区域多边形内部点击选择巡检点。");
+      return;
+    }
+    setFormError("point");
+    state.pointDraft.coords = coords;
+    state.pointDraft.zoneId = zone.id;
+    state.pointDraft.zoneName = zone.name;
+    if (!state.pointDraft.marker) {
+      state.pointDraft.marker = new AMap.Marker({
+        map,
+        position: coords,
+        title: `巡检点 | ${zone.name}`,
+        bubble: true,
+      });
+    } else {
+      state.pointDraft.marker.setPosition(coords);
+      state.pointDraft.marker.setMap(map);
+    }
+    syncPointDraftUi();
+  });
 }
 
 function findPageItem(pageId, itemId) {
@@ -1278,6 +1496,9 @@ function renderPointsPage() {
   if (!pointsData) {
     return renderLoadingPage("点位管理", "配置巡检点位。");
   }
+  const pointPickerStatus = state.pointDraft.coords
+    ? `已选择 ${state.pointDraft.zoneName} 内的巡检点：${state.pointDraft.coords[1].toFixed(6)}, ${state.pointDraft.coords[0].toFixed(6)}`
+    : "请在地图中的巡检区域内点击选择巡检点。";
   const rows = (pointsData.items || []).map((point) => `
     <tr>
       <td>${escapeHtml(point.name)}</td>
@@ -1300,10 +1521,15 @@ function renderPointsPage() {
         <div class="panel-header">
           <div>
             <h2>巡检点位</h2>
-            <p class="muted">每个点位可绑定区域，并可选关联设备。</p>
+            <p class="muted">先在巡检区域内点击地图选点，再提交点位信息。</p>
           </div>
         </div>
         <form id="point-form" class="stack-form">
+          <div id="points-map" class="map-shell"><div class="map-fallback">检测到高德地图后将在此渲染。</div></div>
+          <div class="inline-meta point-picker-meta">
+            <span id="point-picker-status" class="muted">${escapeHtml(pointPickerStatus)}</span>
+            <button class="ghost-button" id="point-picker-reset" type="button">清空选点</button>
+          </div>
           <div class="grid-form">
             <label><span>名称</span><input name="name" required /></label>
             <label><span>区域</span>
@@ -1312,8 +1538,8 @@ function renderPointsPage() {
             <label><span>设备</span>
               <select name="deviceId">${renderSelectOptions(pointsData.devices || [], "", "未设置")}</select>
             </label>
-            <label><span>纬度</span><input name="lat" type="number" step="0.000001" required /></label>
-            <label><span>经度</span><input name="lng" type="number" step="0.000001" required /></label>
+            <label><span>纬度</span><input name="lat" type="number" step="0.000001" required readonly /></label>
+            <label><span>经度</span><input name="lng" type="number" step="0.000001" required readonly /></label>
           </div>
           <label><span>描述</span><textarea name="description" placeholder="点位描述"></textarea></label>
           <div class="button-row">
@@ -1644,11 +1870,22 @@ function bindPointsPage() {
     return;
   }
   bindManagedForm("point-form", "point", async (form) => {
-    const payload = numericPayload(formToObject(form), ["areaId", "deviceId", "lat", "lng"]);
+    if (!state.pointDraft.coords) {
+      throw new Error("请先在巡检区域内点击地图选择巡检点。");
+    }
+    const payload = numericPayload(formToObject(form), ["areaId", "deviceId"]);
+    payload.lat = state.pointDraft.coords[1];
+    payload.lng = state.pointDraft.coords[0];
     await apiFetch("/api/points", { method: "POST", body: JSON.stringify(payload) });
     form.reset();
+    resetPointDraft();
     await ensureManagementPageData("points", true);
   });
+  document.getElementById("point-picker-reset")?.addEventListener("click", () => {
+    resetPointDraft();
+    setFormError("point");
+  });
+  syncPointDraftUi();
   document.querySelectorAll("[data-point-edit]").forEach((button) => {
     button.addEventListener("click", () => {
       const point = findPageItem("points", button.dataset.id);
@@ -1884,11 +2121,17 @@ async function handleCreate(formName, endpoint, transform = (payload) => payload
     setFormError(formName);
     try {
       const payload = transform(formToObject(form));
+      if (formName === "robot" && !payload.ipAddress) {
+        throw new Error("请先扫描当前 Wi-Fi 网络，并选择已确认的机器人 IP。");
+      }
       await apiFetch(endpoint, { method: "POST", body: JSON.stringify(payload) });
       form.reset();
       applyFriendlyFormDefaults(formName, form);
       if (formName === "zone") {
         resetZoneDraft();
+      }
+      if (formName === "robot") {
+        state.robotDiscovery.selectedIp = "";
       }
       await loadDashboard();
     } catch (error) {
@@ -1907,7 +2150,96 @@ function bindZoneTools() {
   document.getElementById("zone-reset-button")?.addEventListener("click", () => {
     resetZoneDraft();
   });
+  document.querySelectorAll("[data-zone-edit]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const zone = (state.data?.zones || []).find((item) => Number(item.id) === Number(button.dataset.id));
+      if (!zone) return;
+      showCrudModal({
+        title: `编辑区域：${zone.name}`,
+        saveText: "保存区域",
+        values: {
+          name: zone.name,
+          type: zone.type,
+          risk: zone.risk,
+          status: zone.status,
+          frequency: zone.frequency,
+          notes: zone.notes || "",
+        },
+        fields: [
+          { name: "name", label: "区域名称", required: true },
+          {
+            name: "type",
+            label: "区域类型",
+            type: "select",
+            options: [
+              { value: "inspection", label: "巡检区" },
+              { value: "charging", label: "充电区" },
+              { value: "storage", label: "仓储区" },
+              { value: "restricted", label: "管控区" },
+            ],
+          },
+          {
+            name: "risk",
+            label: "风险等级",
+            type: "select",
+            options: [
+              { value: "low", label: "低" },
+              { value: "medium", label: "中" },
+              { value: "high", label: "高" },
+            ],
+          },
+          {
+            name: "status",
+            label: "状态",
+            type: "select",
+            options: [
+              { value: "active", label: "启用" },
+              { value: "paused", label: "暂停" },
+            ],
+          },
+          { name: "frequency", label: "巡检频率" },
+          { name: "notes", label: "备注", type: "textarea", className: "field-span-2" },
+        ],
+        onSubmit: async (payload) => {
+          await apiFetch(`/api/zones/${zone.id}`, {
+            method: "PUT",
+            body: JSON.stringify(payload),
+          });
+          await loadDashboard();
+        },
+      });
+    });
+  });
+  document.querySelectorAll("[data-zone-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该区域？")) return;
+      await apiFetch(`/api/zones/${button.dataset.id}`, { method: "DELETE" });
+      await loadDashboard();
+    });
+  });
   syncZoneDraftUi();
+}
+
+function bindRobotDiscoveryTools() {
+  const form = document.getElementById("robot-form");
+  if (!form) return;
+  const select = document.getElementById("robot-discovery-select");
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (select) {
+    state.robotDiscovery.selectedIp = select.value || state.robotDiscovery.selectedIp || "";
+    select.addEventListener("change", () => {
+      state.robotDiscovery.selectedIp = select.value || "";
+      if (submitButton) {
+        submitButton.disabled = !state.robotDiscovery.selectedIp || state.robotDiscovery.loading;
+      }
+    });
+  }
+  document.getElementById("robot-discovery-refresh")?.addEventListener("click", async () => {
+    await fetchRobotDiscovery(true);
+  });
+  if (!state.robotDiscovery.loading && !state.robotDiscovery.scannedAt && !state.robotDiscovery.items.length && !state.robotDiscovery.error) {
+    void fetchRobotDiscovery(true);
+  }
 }
 
 function bindDeleteButtons() {
@@ -1943,6 +2275,7 @@ function bindForms() {
     };
   });
   bindZoneTools();
+  bindRobotDiscoveryTools();
   bindDeleteButtons();
   if (state.pageId === "users") bindUsersPage();
   if (state.pageId === "devices") bindDevicesPage();
@@ -1961,8 +2294,50 @@ function numericPayload(payload, keys) {
   return next;
 }
 
+function syncRobotMarkersInEntry(entry) {
+  if (!entry?.map || typeof window.AMap === "undefined") return;
+  if (!entry.robotMarkers) {
+    entry.robotMarkers = {};
+  }
+  const nextIds = new Set((state.data?.robots || []).map((robot) => String(robot.id)));
+  Object.entries(entry.robotMarkers).forEach(([robotId, marker]) => {
+    if (nextIds.has(robotId)) return;
+    marker.setMap(null);
+    delete entry.robotMarkers[robotId];
+  });
+  (state.data?.robots || []).forEach((robot) => {
+    const robotId = String(robot.id);
+    const position = Array.isArray(robot.location) ? robot.location : null;
+    if (!position || position.length !== 2) return;
+    const label = {
+      content: `${escapeHtml(robot.model)} ${escapeHtml(String(robot.battery))}%`,
+      direction: "top",
+    };
+    if (!entry.robotMarkers[robotId]) {
+      entry.robotMarkers[robotId] = new AMap.Marker({
+        map: entry.map,
+        position,
+        title: robotMarkerTitle(robot),
+        bubble: true,
+        label,
+      });
+      return;
+    }
+    entry.robotMarkers[robotId].setPosition(position);
+    entry.robotMarkers[robotId].setTitle(robotMarkerTitle(robot));
+    entry.robotMarkers[robotId].setLabel(label);
+    entry.robotMarkers[robotId].setMap(entry.map);
+  });
+}
+
+function syncRobotMarkersInMaps() {
+  Object.values(state.maps).forEach((entry) => {
+    syncRobotMarkersInEntry(entry);
+  });
+}
+
 async function renderMaps() {
-  const mapIds = ["overview-map", "zones-map"].filter((id) => document.getElementById(id));
+  const mapIds = ["overview-map", "zones-map", "points-map"].filter((id) => document.getElementById(id));
   state.maps = {};
   if (!mapIds.length) {
     return;
@@ -1998,7 +2373,7 @@ async function renderMaps() {
       zoom: state.data.site.zoom,
       center: userCoords || state.data.site.center,
     });
-    state.maps[id] = { map, userMarker: null, draftPolyline: null, draftPolygon: null };
+    state.maps[id] = { map, userMarker: null, draftPolyline: null, draftPolygon: null, robotMarkers: {} };
     map.addControl(new AMap.Scale());
     map.addControl(new AMap.ToolBar());
     state.data.zones.forEach((zone) => {
@@ -2009,20 +2384,31 @@ async function renderMaps() {
         fillColor: zone.fillColor,
         fillOpacity: 0.38,
         strokeWeight: 2,
+        bubble: true,
       });
     });
-    state.data.robots.forEach((robot) => {
-      new AMap.Marker({
-        map,
-        position: robot.location,
-        title: `${robot.model}（${localizeToken(robot.status)}）`,
+    syncRobotMarkersInEntry(state.maps[id]);
+    if (id === "points-map") {
+      (state.pageData.points?.items || []).forEach((point) => {
+        if (!Number.isFinite(Number(point.lng)) || !Number.isFinite(Number(point.lat))) return;
+        new AMap.Marker({
+          map,
+          position: [Number(point.lng), Number(point.lat)],
+          title: point.name,
+          bubble: true,
+          label: {
+            content: escapeHtml(point.name),
+            direction: "top",
+          },
+        });
       });
-    });
+    }
     if (userCoords) {
       state.maps[id].userMarker = new AMap.Marker({
         map,
         position: userCoords,
         title: "我的当前位置",
+        bubble: true,
         label: {
           content: "我",
           direction: "top",
@@ -2032,6 +2418,102 @@ async function renderMaps() {
     if (id === "zones-map") {
       setupZoneDrawing(map);
     }
+    if (id === "points-map") {
+      setupPointPicker(map);
+      if (state.pointDraft.coords) {
+        if (!state.pointDraft.marker) {
+          state.pointDraft.marker = new AMap.Marker({
+            map,
+            position: state.pointDraft.coords,
+            title: `巡检点 | ${state.pointDraft.zoneName || "未命名区域"}`,
+            bubble: true,
+          });
+        } else {
+          state.pointDraft.marker.setPosition(state.pointDraft.coords);
+          state.pointDraft.marker.setMap(map);
+        }
+      }
+    }
+  });
+}
+
+function canRefreshRealtimePage() {
+  const active = document.activeElement;
+  return !(active && (active.closest("form") || active.closest("dialog")));
+}
+
+function handleDashboardSocketMessage(message) {
+  if (!message || message.type !== "dashboard_update" || !message.data) return;
+  state.data = message.data;
+  renderShellMeta();
+  if (["overview", "status", "maintenance"].includes(state.pageId) && canRefreshRealtimePage()) {
+    renderCurrentPage();
+    return;
+  }
+  if (Object.keys(state.maps).length) {
+    syncRobotMarkersInMaps();
+  }
+}
+
+function clearRealtimeTimers() {
+  if (state.realtime.heartbeatTimer) {
+    window.clearInterval(state.realtime.heartbeatTimer);
+    state.realtime.heartbeatTimer = null;
+  }
+  if (state.realtime.reconnectTimer) {
+    window.clearTimeout(state.realtime.reconnectTimer);
+    state.realtime.reconnectTimer = null;
+  }
+}
+
+function scheduleDashboardSocketReconnect() {
+  if (state.realtime.reconnectTimer) return;
+  state.realtime.reconnectTimer = window.setTimeout(() => {
+    state.realtime.reconnectTimer = null;
+    connectDashboardSocket();
+  }, 3000);
+}
+
+function connectDashboardSocket() {
+  if (typeof window.WebSocket === "undefined") return;
+  const currentSocket = state.realtime.socket;
+  if (currentSocket && (currentSocket.readyState === WebSocket.OPEN || currentSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  clearRealtimeTimers();
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/dashboard`);
+  state.realtime.socket = socket;
+  socket.addEventListener("open", () => {
+    if (state.realtime.socket !== socket) return;
+    state.realtime.heartbeatTimer = window.setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send("ping");
+      }
+    }, 20000);
+  });
+  socket.addEventListener("message", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      handleDashboardSocketMessage(payload);
+    } catch (error) {
+      console.warn("实时消息解析失败。", error);
+    }
+  });
+  socket.addEventListener("error", () => {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (state.realtime.socket === socket) {
+      state.realtime.socket = null;
+    }
+    if (state.realtime.heartbeatTimer) {
+      window.clearInterval(state.realtime.heartbeatTimer);
+      state.realtime.heartbeatTimer = null;
+    }
+    scheduleDashboardSocketReconnect();
   });
 }
 
@@ -2048,6 +2530,10 @@ tickClock();
 setInterval(tickClock, 1000);
 startLocationWatch();
 
-loadDashboard().catch((error) => {
-  pageContent.innerHTML = `<section class="panel"><div class="empty-state">${escapeHtml(error.message)}</div></section>`;
-});
+loadDashboard()
+  .then(() => {
+    connectDashboardSocket();
+  })
+  .catch((error) => {
+    pageContent.innerHTML = `<section class="panel"><div class="empty-state">${escapeHtml(error.message)}</div></section>`;
+  });

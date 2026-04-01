@@ -24,6 +24,8 @@
 Project4/
 ├── backend/                 # Web 后端与页面模板
 ├── desktop/                 # PyQt 桌面端
+├── docs/
+│   └── planning/            # 项目规划与阶段待办
 ├── logs/                    # 诊断脚本输出日志
 ├── scripts/                 # 建库、诊断、IoT 与部署脚本
 ├── .conda/                  # 本地 Python 环境（如果已创建）
@@ -31,7 +33,6 @@ Project4/
 ├── start.bat                # 一键启动后端
 ├── start.ps1                # 后端启动脚本
 ├── test_mysql_connection.bat# 一键诊断 MySQL 连接
-├── todolist.md              # 开发阶段与待办
 └── README.md
 ```
 
@@ -56,12 +57,21 @@ Project4/
 
 ## 当前进度
 
-根据 [todolist.md](./todolist.md) 当前状态如下：
+根据 [docs/planning/todolist.md](./docs/planning/todolist.md) 当前状态如下：
 
 - 阶段一到阶段四已基本完成，包括数据库建模、后端 CRUD、Web 页面和 IoT 通信能力。
 - 阶段五仍在进行中，主要是前后端联调、设备模拟和端到端流程测试。
 
 如果你是第一次接手这个仓库，可以优先从 Web 后端启动和数据库连通性检查开始。
+
+## 仓库整理说明
+
+当前仓库按“源码 + 文档规划 + 本地产物”划分：
+
+- `backend/`、`desktop/`、`scripts/` 仍是主要源码目录，保持现有运行路径不变。
+- `docs/planning/` 用于放置阶段规划和待办文档，当前 `todolist.md` 已移动到这里。
+- `.conda/`、`logs/`、`test-results/`、`.claude/` 等目录属于本地环境、调试或生成产物，不作为主结构的一部分。
+
 
 ## 环境要求
 
@@ -165,10 +175,24 @@ cd E:\Code\Project4\backend
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+如果是在 Ubuntu 服务器等长期运行场景，建议去掉 `--reload`：
+
+```powershell
+cd E:\Code\Project4\backend
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
 启动后可访问：
 
-- 登录页：<http://127.0.0.1:8000/login>
-- 健康检查：<http://127.0.0.1:8000/api/health>
+- 局域网 HTTPS 登录页：<https://192.168.31.169/login>
+- 局域网 HTTPS 健康检查：<https://192.168.31.169/api/health>
+- 本机直连登录页：<http://127.0.0.1:8000/login>
+- 本机直连健康检查：<http://127.0.0.1:8000/api/health>
+
+说明：
+
+- 浏览器如需网页定位，优先通过 HTTPS 入口访问，而不是直接访问 `http://<服务器IP>:8000`。
+- `http://<服务器IP>:8000` 更适合后端直连调试；在 Chrome 中通过局域网 HTTP 地址访问时，浏览器定位可能被安全策略拦截。
 
 如果没有在环境变量中覆盖管理员账号，默认登录信息通常为：
 
@@ -210,18 +234,110 @@ cd E:\Code\Project4\scripts
 python iot_client.py --server http://127.0.0.1:8000 --token <DEVICE_TOKEN>
 ```
 
+如果要单独诊断树莓派 GPS，可执行：
+
+```powershell
+cd E:\Code\Project4\scripts
+python iot_client.py --server http://127.0.0.1:8000 --token <DEVICE_TOKEN> --gps-diagnose
+```
+
+如果 GPS 模块走固定串口，也可以显式指定：
+
+```powershell
+python iot_client.py --server http://127.0.0.1:8000 --token <DEVICE_TOKEN> --gps-diagnose --gps-serial-device /dev/ttyAMA0 --gps-serial-baud 9600
+```
+
+诊断输出会优先检查：
+
+- `gpspipe -w` 是否能返回 `TPV`
+- `gpspipe -r` 是否能读到原始 NMEA
+- 指定串口或常见串口设备是否有原始输出
+
+遥测上报时，`extra.gps` 里也会带上当前 GPS 状态摘要，便于在服务端排查“未安装 gpspipe / 有 NMEA 但无 fix / 串口完全无输出”等问题。
+
+如果设备没有 GPS，也可以启用“网络定位 fallback”：
+
+- 当前脚本支持 `Google Geolocation API`
+- 有 Wi-Fi 扫描权限时会优先上传附近热点信息
+- 扫描不到热点时，可按配置退回到公网 IP 粗定位
+
+示例配置：
+
+```ini
+network_locate_enabled = 1
+network_provider = google
+network_api_key = <YOUR_GOOGLE_GEOLOCATION_API_KEY>
+network_api_url = https://www.googleapis.com/geolocation/v1/geolocate
+network_timeout = 10
+network_interface = wlan0
+network_consider_ip = 1
+```
+
+说明：
+
+- 网络定位精度通常明显弱于 GPS，建议只作为兜底方案。
+- `network_consider_ip = 1` 时，即使没有 Wi-Fi 扫描结果，也可能返回一个较粗的 IP 定位。
+- 若设备侧没有开启扫描权限，脚本仍会继续工作，只是会更依赖 IP 粗定位。
+
+### 当前设备现状
+
+基于 `192.168.31.200` 这台树莓派设备的实际排查结果，当前状态如下：
+
+- 后端遥测上报正常，来源 IP 为 `192.168.31.200`
+- 当前稳定上报字段包括：
+  - `status`
+  - `signal`
+  - `extra.cpu_temp_c`
+  - `reportedAt`
+  - `extra.gps.status / source / message`
+  - `extra.locationSource`
+- 当前未产生巡检打卡记录，因为配置仍是 `point_id = 0`、`route_id = 0`
+
+### GPS 现状
+
+当前设备没有产出可用 GPS 坐标，已经确认的现象包括：
+
+- `gpsd` 和 `gpspipe` 已安装并可运行
+- `gpspipe -w` 只能返回 `VERSION / DEVICES / WATCH`
+- `gpspipe -r` 没有返回任何 NMEA 数据
+- `/dev/ttyAMA0`、`/dev/ttyS0` 在多轮诊断和多波特率扫描下都没有输出
+- 已移除 `/boot/cmdline.txt` 中的 `console=serial0,115200`
+- 已禁用 `serial-getty@ttyS0.service`
+
+结论：
+
+- 当前更像是“设备没有接入可工作的 GPS 模块”或“GPS 模块没有向树莓派串口输出数据”
+- 如果后续需要位置能力，优先级建议为：
+  1. 接入真实 GPS 模块
+  2. 或启用网络定位 fallback
+
+### 电池信息现状
+
+当前设备还不能上传电池信息，已确认：
+
+- `/sys/class/power_supply` 为空，没有 `BAT0`
+- 没发现 `INA219 / INA226 / MAX17040 / BQ*` 等常见电量采集芯片或驱动
+- I2C 总线上的 `0x40` 设备更像 `PCA9685` PWM 控制器，而不是电池计量芯片
+
+结论：
+
+- 目前系统里没有发现可直接读取的电池信息源
+- 如果后续需要电池百分比，需要额外接入：
+  - UPS / BMS / fuel gauge 芯片
+  - 或者由下位控制板通过串口 / I2C / HTTP 回传电压与电量
+
 ### 部署到树莓派
 
 Linux 侧脚本：
 
 ```bash
-bash scripts/setup_pi_iot.sh <SERVER_URL> <DEVICE_TOKEN> [INTERVAL] [POINT_ID] [ROUTE_ID]
+bash scripts/setup_pi_iot.sh <SERVER_URL> <DEVICE_TOKEN> [INTERVAL] [POINT_ID] [ROUTE_ID] [GPS_SERIAL_DEVICE] [GPS_SERIAL_BAUD]
 ```
 
 Windows 远程部署脚本：
 
 ```powershell
-python scripts\deploy_iot_client.py --host <PI_HOST> --password <PI_PASSWORD> --server <SERVER_URL> --token <DEVICE_TOKEN>
+python scripts\deploy_iot_client.py --host <PI_HOST> --password <PI_PASSWORD> --server <SERVER_URL> --token <DEVICE_TOKEN> --gps-serial-device /dev/ttyAMA0 --network-locate-enabled --network-api-key <GOOGLE_API_KEY>
 ```
 
 ## 常用脚本

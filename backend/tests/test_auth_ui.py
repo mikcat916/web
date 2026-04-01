@@ -9,6 +9,7 @@ def fake_user():
         "username": "admin",
         "password_hash": "hash",
         "display_name": "Admin User",
+        "status": "active",
         "created_at": "2026-03-10T12:00",
     }
 
@@ -22,6 +23,8 @@ def mock_auth(monkeypatch):
     monkeypatch.setattr(app_module, "mysql_configured", lambda: True)
     monkeypatch.setattr(app_module, "ensure_database", lambda: None)
     monkeypatch.setattr(app_module, "execute_schema", lambda: None)
+    monkeypatch.setattr(app_module, "ensure_iot_tables", lambda: None)
+    monkeypatch.setattr(app_module, "ensure_robot_ip_column", lambda: None)
     monkeypatch.setattr(app_module, "ensure_admin_user", lambda: None)
     monkeypatch.setattr(app_module, "get_user_by_username", lambda username: fake_user())
     monkeypatch.setattr(app_module, "verify_password", lambda password, password_hash: True)
@@ -32,6 +35,15 @@ def test_login_page_available_without_mysql():
         response = client.get("/login")
     assert response.status_code == 200
     assert "机器人巡检平台" in response.text
+    assert "注册" in response.text
+
+
+def test_login_page_enables_registration_by_default(monkeypatch):
+    monkeypatch.delenv("ALLOW_SELF_REGISTER", raising=False)
+    with TestClient(app_module.app) as client:
+        response = client.get("/login")
+    assert response.status_code == 200
+    assert "allowSelfRegister: true" in response.text
 
 
 def test_page_requires_login_redirect():
@@ -86,6 +98,131 @@ def test_authenticated_dashboard_and_logout(monkeypatch):
     assert dashboard_response.json()["data"]["counts"]["robots"] == 1
     assert logout_response.status_code == 200
     assert after_logout.status_code == 401
+
+
+def test_register_rejected_when_disabled(monkeypatch):
+    mock_auth(monkeypatch)
+    monkeypatch.setattr(app_module, "mysql_ready", lambda: True)
+    monkeypatch.setenv("ALLOW_SELF_REGISTER", "0")
+
+    with TestClient(app_module.app) as client:
+        response = client.post(
+            "/auth/register",
+            json={"username": "newuser", "password": "secret123", "displayName": "New User"},
+        )
+
+    assert response.status_code == 403
+
+
+def test_register_success_and_dashboard_access(monkeypatch):
+    mock_auth(monkeypatch)
+    monkeypatch.setattr(app_module, "mysql_ready", lambda: True)
+    monkeypatch.setattr(app_module, "hash_password", lambda password: f"hashed:{password}")
+    monkeypatch.setenv("ALLOW_SELF_REGISTER", "1")
+
+    users = {}
+
+    def fake_get_user(username):
+        return users.get(username)
+
+    def fake_execute_write(sql, params=None):
+        username, password_hash, display_name, created_at = params
+        users[username] = {
+            "id": len(users) + 1,
+            "username": username,
+            "password_hash": password_hash,
+            "display_name": display_name,
+            "status": "active",
+            "created_at": created_at,
+        }
+        return 1
+
+    monkeypatch.setattr(app_module, "get_user_by_username", fake_get_user)
+    monkeypatch.setattr(app_module, "execute_write", fake_execute_write)
+    monkeypatch.setattr(
+        app_module,
+        "build_dashboard_payload",
+        lambda: {
+            "site": app_module.DEFAULT_SITE,
+            "counts": {"robots": 0, "tasks": 0, "alerts": 0, "reports": 0, "zones": 0},
+            "robots": [],
+            "tasks": [],
+            "alerts": [],
+            "reports": [],
+            "zones": [],
+            "maintenance": [],
+            "generatedAt": "2026-03-10T12:00",
+        },
+    )
+
+    with TestClient(app_module.app) as client:
+        response = client.post(
+            "/auth/register",
+            json={"username": "newuser", "password": "secret123", "displayName": "New User"},
+        )
+        dashboard_response = client.get("/api/dashboard")
+
+    assert response.status_code == 200
+    assert response.json()["user"]["username"] == "newuser"
+    assert dashboard_response.status_code == 200
+
+
+def test_register_rejects_duplicate_username(monkeypatch):
+    mock_auth(monkeypatch)
+    monkeypatch.setattr(app_module, "mysql_ready", lambda: True)
+    monkeypatch.setenv("ALLOW_SELF_REGISTER", "1")
+    monkeypatch.setattr(app_module, "get_user_by_username", lambda username: fake_user())
+
+    with TestClient(app_module.app) as client:
+        response = client.post(
+            "/auth/register",
+            json={"username": "admin", "password": "secret123", "displayName": "Admin User"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_zone_update_and_delete(monkeypatch):
+    mock_auth(monkeypatch)
+
+    events = []
+
+    async def fake_ws_broadcast(event):
+        events.append(event)
+
+    monkeypatch.setattr(
+        app_module,
+        "load_zone",
+        lambda zone_id: {
+            "id": zone_id,
+            "name": "旧区域",
+            "type": "inspection",
+            "risk": "medium",
+            "status": "active",
+            "frequency": "30分钟/次",
+            "strokeColor": "#0db9f2",
+            "fillColor": "rgba(13, 185, 242, 0.18)",
+            "path": [[121.81, 31.09], [121.82, 31.09], [121.815, 31.08]],
+            "notes": "旧备注",
+            "createdAt": "2026-03-10T12:00",
+            "center": [121.815, 31.086],
+        },
+    )
+    monkeypatch.setattr(app_module, "execute_write", lambda sql, params=None: 1)
+    monkeypatch.setattr(app_module, "clear_table", lambda table_name, record_id: 1)
+    monkeypatch.setattr(app_module, "ws_broadcast", fake_ws_broadcast)
+
+    with TestClient(app_module.app) as client:
+        login(client)
+        update_response = client.put(
+            "/api/zones/1",
+            json={"name": "新区域", "notes": "新备注", "risk": "high"},
+        )
+        delete_response = client.delete("/api/zones/1")
+
+    assert update_response.status_code == 200
+    assert delete_response.status_code == 200
+    assert events == ["zone_updated", "zone_deleted"]
 
 
 def test_health_endpoint(monkeypatch):

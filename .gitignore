@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -54,6 +55,8 @@ Thumbs.db
 # Local runtime outputs
 .pydeps/
 logs/
+test-results/
+.claude/worktrees/
 backend/static/uploads/
 pytest-cache-files-*/
 backend/pytest-cache-files-*/

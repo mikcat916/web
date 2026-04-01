@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/dashboard.css">
+  <link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version }}">
 </head>
 <body class="auth-page">
   <main class="login-panel">
@@ -23,10 +23,19 @@
       </div>
       {% endif %}
 
+      <div class="auth-switch" role="tablist" aria-label="登录与注册"{% if not allow_self_register %} hidden{% endif %}>
+        <button id="auth-mode-login" class="secondary-button active" type="button" data-auth-mode="login">登录</button>
+        <button id="auth-mode-register" class="secondary-button" type="button" data-auth-mode="register">注册</button>
+      </div>
+
       <form id="login-form" class="stack-form">
         <label>
           <span>用户名</span>
           <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label class="register-only" hidden>
+          <span>显示名称</span>
+          <input type="text" name="displayName" autocomplete="nickname" placeholder="留空则默认使用用户名">
         </label>
         <label>
           <span>密码</span>
@@ -39,8 +48,8 @@
   </main>
 
   <script>
-    window.APP_CONFIG = { mysqlReady: {{ mysql_ready|tojson }} };
+    window.APP_CONFIG = { mysqlReady: {{ mysql_ready|tojson }}, allowSelfRegister: {{ allow_self_register|tojson }} };
   </script>
-  <script src="/static/login.js" defer></script>
+  <script src="/static/login.js?v={{ asset_version }}" defer></script>
 </body>
 </html>
