@@ -433,6 +433,17 @@ code, pre { font-family: var(--font-mono); }
 
 .data-table tr:last-child td { border-bottom: 0; }
 
+.table-select-cell {
+  width: 52px;
+}
+
+.table-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
 .stack-form {
   display: grid;
   gap: 16px;
@@ -551,6 +562,14 @@ button:disabled {
 .toolbar-filters input,
 .toolbar-filters select {
   min-width: 180px;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
 }
 
 .form-error {

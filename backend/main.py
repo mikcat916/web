@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import asyncio
+import bcrypt
 import re
 import shutil
 import socket
@@ -81,6 +82,7 @@ REQUIRED_MYSQL_ENV = (
     "MYSQL_DATABASE",
 )
 MAX_ID_VALUE = 2_147_483_647
+LEGACY_PASSWORD_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 DEFAULT_SITE = {
     "name": "机器人巡检指挥中心",
@@ -376,11 +378,21 @@ def execute_insert(sql: str, params: tuple[Any, ...] | None = None) -> int:
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def is_legacy_password_hash(password_hash: Any) -> bool:
+    return bool(LEGACY_PASSWORD_HASH_RE.fullmatch(str(password_hash or "").strip()))
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return hmac.compare_digest(hash_password(password), password_hash)
+    normalized_hash = str(password_hash or "").strip()
+    if is_legacy_password_hash(normalized_hash):
+        return hmac.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), normalized_hash.lower())
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), normalized_hash.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 def get_user_by_username(username: str) -> dict[str, Any] | None:
@@ -408,6 +420,18 @@ def validate_auth_user_payload(payload: dict[str, Any]) -> tuple[str, str, str]:
     if len(display_name) > 128:
         raise HTTPException(status_code=422, detail="显示名称长度不能超过 128 个字符。")
     return username, password, display_name
+
+
+def validate_auth_user_update_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    display_name = str(payload.get("displayName", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    if not display_name and not password:
+        raise HTTPException(status_code=422, detail="至少提供 displayName 或 password 之一。")
+    if display_name and len(display_name) > 128:
+        raise HTTPException(status_code=422, detail="显示名称长度不能超过 128 个字符。")
+    if password and len(password) < 6:
+        raise HTTPException(status_code=422, detail="密码长度至少为 6 位。")
+    return display_name, password
 
 
 def ensure_admin_user() -> None:
@@ -445,6 +469,32 @@ def template_user(user: dict[str, Any] | None) -> dict[str, str] | None:
         "username": str(user.get("username", "")),
         "display_name": str(user.get("display_name", "") or user.get("username", "")),
     }
+
+
+def visible_pages_for_user(user: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    if is_admin_user(user):
+        return dict(PAGES)
+    return {key: value for key, value in PAGES.items() if key != "users"}
+
+
+def forbidden_page(detail: str = "仅管理员可访问当前页面。") -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>403 | 机器人巡检平台</title>
+</head>
+<body>
+  <main style="max-width:640px;margin:64px auto;padding:0 24px;font-family:'Noto Sans SC','Segoe UI',sans-serif;">
+    <h1 style="font-size:32px;margin-bottom:12px;">403</h1>
+    <p style="font-size:16px;line-height:1.7;">{detail}</p>
+  </main>
+</body>
+</html>""",
+        status_code=403,
+    )
 
 
 def require_page_login(request: Request):
@@ -539,6 +589,21 @@ def parse_strict_id(value: Any, field_name: str) -> int:
     if number < 1 or number > MAX_ID_VALUE:
         raise HTTPException(status_code=422, detail=f"{field_name} 必须在 1 到 {MAX_ID_VALUE} 之间。")
     return number
+
+
+def normalize_entity_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def normalized_name_key(value: Any) -> str:
+    return normalize_entity_name(value).lower()
+
+
+def normalize_pagination(page: int = 1, size: int = 20) -> tuple[int, int, int]:
+    normalized_size = min(max(int(size or 20), 1), 100)
+    normalized_page = max(int(page or 1), 1)
+    offset = (normalized_page - 1) * normalized_size
+    return normalized_page, normalized_size, offset
 
 
 def parse_float(value: Any, field_name: str) -> float:
@@ -974,6 +1039,41 @@ def load_zones() -> list[dict[str, Any]]:
     return zones
 
 
+def load_zones_page(page: int = 1, size: int = 20) -> dict[str, Any]:
+    page, size, offset = normalize_pagination(page, size)
+    total_row = query_one("SELECT COUNT(*) AS cnt FROM zones")
+    total = int(total_row["cnt"]) if total_row else 0
+    rows = query_all(
+        """
+        SELECT id, name, type, risk, status, frequency, stroke_color, fill_color, path_json, notes, created_at
+        FROM zones
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s OFFSET %s
+        """,
+        (size, offset),
+    )
+    items = []
+    for row in rows:
+        path = parse_zone_path(row["path_json"])
+        items.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "type": row["type"],
+                "risk": row["risk"],
+                "status": row["status"],
+                "frequency": row["frequency"],
+                "strokeColor": row["stroke_color"] or "#7cc7ff",
+                "fillColor": row["fill_color"] or "rgba(124, 199, 255, 0.18)",
+                "path": path,
+                "notes": row["notes"] or "",
+                "createdAt": to_iso_datetime(row["created_at"]),
+                "center": zone_center(path),
+            }
+        )
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
 def load_zone(zone_id: int) -> dict[str, Any] | None:
     row = query_one(
         """
@@ -1204,6 +1304,39 @@ def load_reports() -> list[dict[str, Any]]:
     ]
 
 
+def load_reports_page(page: int = 1, size: int = 20) -> dict[str, Any]:
+    page, size, offset = normalize_pagination(page, size)
+    total_row = query_one("SELECT COUNT(*) AS cnt FROM reports")
+    total = int(total_row["cnt"]) if total_row else 0
+    rows = query_all(
+        """
+        SELECT id, title, value, trend, tone, detail, report_date, created_at
+        FROM reports
+        ORDER BY report_date DESC, id DESC
+        LIMIT %s OFFSET %s
+        """,
+        (size, offset),
+    )
+    return {
+        "items": [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "value": row["value"],
+                "trend": row["trend"],
+                "tone": row["tone"],
+                "detail": row["detail"] or "",
+                "reportDate": to_iso_date(row["report_date"]),
+                "createdAt": to_iso_datetime(row["created_at"]),
+            }
+            for row in rows
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
 def build_maintenance_items(robots: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Aggregate maintenance feed using real robot status from DB.
     status_map = {
@@ -1374,7 +1507,7 @@ def build_report_record(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_zone_record(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name", "")).strip()
+    name = normalize_entity_name(payload.get("name", ""))
     if not name:
         raise HTTPException(status_code=422, detail="区域名称不能为空。")
     path = parse_zone_path(payload.get("path"))
@@ -1562,6 +1695,64 @@ def clear_table(table_name: str, record_id: int) -> int:
     return execute_write(f"DELETE FROM {table_name} WHERE id = %s", (record_id,))
 
 
+def area_name_exists(name: str, exclude_id: int | None = None) -> bool:
+    params: list[Any] = [normalized_name_key(name)]
+    sql = "SELECT id FROM areas WHERE LOWER(TRIM(name)) = %s"
+    if exclude_id is not None:
+        sql += " AND id <> %s"
+        params.append(exclude_id)
+    sql += " LIMIT 1"
+    return bool(query_one(sql, tuple(params)))
+
+
+def zone_name_exists(name: str, exclude_id: int | None = None) -> bool:
+    params: list[Any] = [normalized_name_key(name)]
+    sql = "SELECT id FROM zones WHERE LOWER(TRIM(name)) = %s"
+    if exclude_id is not None:
+        sql += " AND id <> %s"
+        params.append(exclude_id)
+    sql += " LIMIT 1"
+    return bool(query_one(sql, tuple(params)))
+
+
+def ensure_unique_area_name(name: str, exclude_id: int | None = None) -> None:
+    if area_name_exists(name, exclude_id):
+        raise HTTPException(status_code=409, detail=f"区域名称“{name}”已存在。")
+
+
+def ensure_unique_zone_name(name: str, exclude_id: int | None = None) -> None:
+    if zone_name_exists(name, exclude_id):
+        raise HTTPException(status_code=409, detail=f"区域名称“{name}”已存在。")
+
+
+def format_area_association_detail(counts: dict[str, int]) -> str:
+    parts = []
+    if counts["devices"]:
+        parts.append(f"设备 {counts['devices']} 个")
+    if counts["points"]:
+        parts.append(f"巡检点 {counts['points']} 个")
+    if counts["routes"]:
+        parts.append(f"路线 {counts['routes']} 条")
+    return "、".join(parts)
+
+
+def get_area_association_counts(area_id: int) -> dict[str, int]:
+    device_row = query_one("SELECT COUNT(*) AS cnt FROM devices WHERE area_id = %s", (area_id,))
+    point_row = query_one("SELECT COUNT(*) AS cnt FROM points WHERE area_id = %s", (area_id,))
+    route_row = query_one("SELECT COUNT(*) AS cnt FROM routes WHERE area_id = %s", (area_id,))
+    return {
+        "devices": int(device_row["cnt"]) if device_row else 0,
+        "points": int(point_row["cnt"]) if point_row else 0,
+        "routes": int(route_row["cnt"]) if route_row else 0,
+    }
+
+
+def ensure_area_deletable(area_id: int) -> dict[str, int]:
+    if not query_one("SELECT id FROM areas WHERE id = %s LIMIT 1", (area_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应区域。")
+    return get_area_association_counts(area_id)
+
+
 def amap_script_tag() -> str:
     amap_key = os.getenv("AMAP_WEB_KEY", "").strip()
     if not amap_key:
@@ -1578,6 +1769,8 @@ def render_page(request: Request, page_id: str) -> HTMLResponse | RedirectRespon
     user = require_page_login(request)
     if isinstance(user, RedirectResponse):
         return user
+    if page_id == "users" and not is_admin_user(user):
+        return forbidden_page("仅管理员可访问用户管理页面。")
     safe_user = template_user(user)
     page = PAGES[page_id]
     return templates.TemplateResponse(
@@ -1591,7 +1784,7 @@ def render_page(request: Request, page_id: str) -> HTMLResponse | RedirectRespon
             "amap_key": os.getenv("AMAP_WEB_KEY", "").strip(),
             "amap_script": amap_script_tag(),
             "current_user": safe_user,
-            "pages": PAGES,
+            "pages": visible_pages_for_user(user),
             "site": DEFAULT_SITE,
             "mysql_ready": mysql_ready(),
             "asset_version": asset_version(),
@@ -1663,6 +1856,11 @@ async def login(request: Request) -> JSONResponse:
         raise HTTPException(status_code=401, detail="用户名或密码错误。")
     if str(user.get("status", "active")).strip().lower() == "disabled":
         raise HTTPException(status_code=403, detail="当前账号已被禁用。")
+    if is_legacy_password_hash(user.get("password_hash")):
+        execute_write(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (hash_password(password), user["id"]),
+        )
     request.session["username"] = user["username"]
     return JSONResponse(
         {
@@ -1910,9 +2108,12 @@ async def api_delete_alert(alert_id: int, request: Request) -> JSONResponse:
 
 
 @app.get("/api/reports")
-async def api_reports(request: Request) -> JSONResponse:
+async def api_reports(request: Request, page: int = 1, size: int = 20) -> JSONResponse:
     require_api_login(request)
-    return JSONResponse({"items": load_reports() if mysql_ready() else []})
+    page, size, _ = normalize_pagination(page, size)
+    return JSONResponse(
+        load_reports_page(page, size) if mysql_ready() else {"items": [], "total": 0, "page": page, "size": size}
+    )
 
 
 @app.post("/api/reports")
@@ -1935,15 +2136,19 @@ async def api_delete_report(report_id: int, request: Request) -> JSONResponse:
 
 
 @app.get("/api/zones")
-async def api_zones(request: Request) -> JSONResponse:
+async def api_zones(request: Request, page: int = 1, size: int = 20) -> JSONResponse:
     require_api_login(request)
-    return JSONResponse({"items": load_zones() if mysql_ready() else []})
+    page, size, _ = normalize_pagination(page, size)
+    return JSONResponse(
+        load_zones_page(page, size) if mysql_ready() else {"items": [], "total": 0, "page": page, "size": size}
+    )
 
 
 @app.post("/api/zones")
 async def api_create_zone(request: Request) -> JSONResponse:
     require_api_login(request)
     record = build_zone_record(await request.json())
+    ensure_unique_zone_name(record["name"])
     insert_zone(record)
     await ws_broadcast("zone_created")
     return JSONResponse({"ok": True})
@@ -1970,6 +2175,7 @@ async def api_update_zone(zone_id: int, request: Request) -> JSONResponse:
             "notes": payload.get("notes", existing["notes"]),
         }
     )
+    ensure_unique_zone_name(record["name"], zone_id)
     affected = execute_write(
         """
         UPDATE zones
@@ -2040,7 +2246,7 @@ def load_users(page: int = 1, size: int = 20) -> dict[str, Any]:
 
 @app.get("/api/users")
 async def api_users(request: Request, page: int = 1, size: int = 20) -> JSONResponse:
-    require_api_login(request)
+    require_admin_login(request)
     size = min(max(size, 1), 100)
     page = max(page, 1)
     return JSONResponse(
@@ -2050,7 +2256,7 @@ async def api_users(request: Request, page: int = 1, size: int = 20) -> JSONResp
 
 @app.post("/api/users")
 async def api_create_user(request: Request) -> JSONResponse:
-    require_api_login(request)
+    require_admin_login(request)
     payload = await request.json()
     username, password, display_name = validate_auth_user_payload(payload)
     if get_user_by_username(username):
@@ -2064,13 +2270,13 @@ async def api_create_user(request: Request) -> JSONResponse:
 
 @app.put("/api/users/{user_id}")
 async def api_update_user(user_id: int, request: Request) -> JSONResponse:
-    require_api_login(request)
+    require_admin_login(request)
     user_id = parse_strict_id(user_id, "user_id")
     payload = await request.json()
-    display_name = str(payload.get("displayName", "")).strip()
-    password = str(payload.get("password", "")).strip()
-    if not display_name and not password:
-        raise HTTPException(status_code=422, detail="至少提供 displayName 或 password 之一。")
+    display_name, password = validate_auth_user_update_payload(payload)
+    target = query_one("SELECT id FROM users WHERE id = %s", (user_id,))
+    if not target:
+        raise HTTPException(status_code=404, detail="未找到对应用户。")
     if display_name:
         execute_write("UPDATE users SET display_name = %s WHERE id = %s", (display_name, user_id))
     if password:
@@ -2078,9 +2284,23 @@ async def api_update_user(user_id: int, request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+def ensure_area_exists(area_id: int | None) -> None:
+    if area_id is None:
+        return
+    if not query_one("SELECT id FROM areas WHERE id = %s", (area_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应区域。")
+
+
+def ensure_device_exists(device_id: int | None) -> None:
+    if device_id is None:
+        return
+    if not query_one("SELECT id FROM devices WHERE id = %s", (device_id,)):
+        raise HTTPException(status_code=404, detail="未找到对应设备。")
+
+
 @app.patch("/api/users/{user_id}/status")
 async def api_update_user_status(user_id: int, request: Request) -> JSONResponse:
-    require_api_login(request)
+    require_admin_login(request)
     user_id = parse_strict_id(user_id, "user_id")
     payload = await request.json()
     status = str(payload.get("status", "")).strip()
@@ -2229,24 +2449,112 @@ def load_areas() -> list[dict[str, Any]]:
     ]
 
 
+def load_areas_page(page: int = 1, size: int = 20, keyword: str = "") -> dict[str, Any]:
+    page, size, offset = normalize_pagination(page, size)
+    normalized_keyword = normalize_entity_name(keyword)
+    where_clause = ""
+    params: list[Any] = []
+    if normalized_keyword:
+        like_keyword = f"%{normalized_keyword}%"
+        where_clause = "WHERE name LIKE %s OR manager LIKE %s OR description LIKE %s"
+        params.extend([like_keyword, like_keyword, like_keyword])
+    total_sql = "SELECT COUNT(*) AS cnt FROM areas"
+    list_sql = """
+        SELECT id, name, description, manager, created_at
+        FROM areas
+    """
+    if where_clause:
+        total_sql = f"{total_sql} {where_clause}"
+        list_sql = f"{list_sql} {where_clause}"
+    total_row = query_one(total_sql, tuple(params) if params else None)
+    total = int(total_row["cnt"]) if total_row else 0
+    list_sql += " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
+    rows = query_all(list_sql, tuple(params + [size, offset]))
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "description": r["description"] or "",
+                "manager": r["manager"] or "",
+                "createdAt": to_iso_datetime(r["created_at"]),
+            }
+            for r in rows
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+        "keyword": normalized_keyword,
+    }
+
+
 @app.get("/api/areas")
-async def api_areas(request: Request) -> JSONResponse:
+async def api_areas(request: Request, page: int = 1, size: int = 20, keyword: str = "") -> JSONResponse:
     require_api_login(request)
-    return JSONResponse({"items": load_areas() if mysql_ready() else []})
+    page, size, _ = normalize_pagination(page, size)
+    normalized_keyword = normalize_entity_name(keyword)
+    return JSONResponse(
+        load_areas_page(page, size, normalized_keyword)
+        if mysql_ready()
+        else {"items": [], "total": 0, "page": page, "size": size, "keyword": normalized_keyword}
+    )
 
 
 @app.post("/api/areas")
 async def api_create_area(request: Request) -> JSONResponse:
     require_api_login(request)
     payload = await request.json()
-    name = str(payload.get("name", "")).strip()
+    name = normalize_entity_name(payload.get("name", ""))
     if not name:
         raise HTTPException(status_code=422, detail="区域名称不能为空。")
+    ensure_unique_area_name(name)
     execute_write(
         "INSERT INTO areas (name, description, manager, created_at) VALUES (%s, %s, %s, %s)",
-        (name, str(payload.get("description", "")).strip(), str(payload.get("manager", "")).strip(), datetime.now()),
+        (name, normalize_entity_name(payload.get("description", "")), normalize_entity_name(payload.get("manager", "")), datetime.now()),
     )
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/areas/batch-delete")
+async def api_batch_delete_areas(request: Request) -> JSONResponse:
+    require_api_login(request)
+    payload = await request.json()
+    ids = payload.get("ids", [])
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=422, detail="ids 必须是非空数组。")
+    normalized_ids: list[int] = []
+    seen_ids: set[int] = set()
+    failures = []
+    for index, area_id in enumerate(ids):
+        parsed_id = parse_strict_id(area_id, f"ids[{index}]")
+        if parsed_id in seen_ids:
+            raise HTTPException(status_code=422, detail="批量删除的区域 ID 不能重复。")
+        seen_ids.add(parsed_id)
+        normalized_ids.append(parsed_id)
+    for area_id in normalized_ids:
+        if not query_one("SELECT id FROM areas WHERE id = %s LIMIT 1", (area_id,)):
+            failures.append({"id": area_id, "reason": "未找到对应区域。", "associations": {"devices": 0, "points": 0, "routes": 0}})
+            continue
+        counts = get_area_association_counts(area_id)
+        if any(counts.values()):
+            failures.append(
+                {
+                    "id": area_id,
+                    "reason": f"该区域下仍有关联数据：{format_area_association_detail(counts)}。",
+                    "associations": counts,
+                }
+            )
+    if failures:
+        return JSONResponse(
+            {
+                "detail": "选中的区域中存在不可删除项，本次批量删除未执行。",
+                "failures": failures,
+            },
+            status_code=409,
+        )
+    placeholders = ", ".join(["%s"] * len(normalized_ids))
+    deleted = execute_write(f"DELETE FROM areas WHERE id IN ({placeholders})", tuple(normalized_ids))
+    return JSONResponse({"ok": True, "deleted": deleted})
 
 
 @app.put("/api/areas/{area_id}")
@@ -2254,12 +2562,13 @@ async def api_update_area(area_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
     area_id = parse_strict_id(area_id, "area_id")
     payload = await request.json()
-    name = str(payload.get("name", "")).strip()
+    name = normalize_entity_name(payload.get("name", ""))
     if not name:
         raise HTTPException(status_code=422, detail="区域名称不能为空。")
+    ensure_unique_area_name(name, area_id)
     affected = execute_write(
         "UPDATE areas SET name=%s, description=%s, manager=%s WHERE id=%s",
-        (name, str(payload.get("description", "")).strip(), str(payload.get("manager", "")).strip(), area_id),
+        (name, normalize_entity_name(payload.get("description", "")), normalize_entity_name(payload.get("manager", "")), area_id),
     )
     if affected == 0:
         raise HTTPException(status_code=404, detail="未找到对应区域。")
@@ -2270,9 +2579,18 @@ async def api_update_area(area_id: int, request: Request) -> JSONResponse:
 async def api_delete_area(area_id: int, request: Request) -> JSONResponse:
     require_api_login(request)
     area_id = parse_strict_id(area_id, "area_id")
+    counts = ensure_area_deletable(area_id)
+    if any(counts.values()):
+        return JSONResponse(
+            {
+                "detail": f"该区域下仍有关联数据，无法删除：{format_area_association_detail(counts)}。",
+                "associations": counts,
+            },
+            status_code=409,
+        )
     if clear_table("areas", area_id) == 0:
         raise HTTPException(status_code=404, detail="未找到对应区域。")
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "associations": counts})
 
 
 # 巡检点
@@ -2330,6 +2648,8 @@ async def api_create_point(request: Request) -> JSONResponse:
         area_id = parse_strict_id(area_id, "areaId")
     if device_id is not None:
         device_id = parse_strict_id(device_id, "deviceId")
+    ensure_area_exists(area_id)
+    ensure_device_exists(device_id)
     execute_write(
         "INSERT INTO points (name, area_id, device_id, lat, lng, description, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (name, area_id, device_id, lat, lng, str(payload.get("description", "")).strip(), datetime.now()),
@@ -2354,6 +2674,8 @@ async def api_update_point(point_id: int, request: Request) -> JSONResponse:
         area_id = parse_strict_id(area_id, "areaId")
     if device_id is not None:
         device_id = parse_strict_id(device_id, "deviceId")
+    ensure_area_exists(area_id)
+    ensure_device_exists(device_id)
     affected = execute_write(
         "UPDATE points SET name=%s, area_id=%s, device_id=%s, lat=%s, lng=%s, description=%s WHERE id=%s",
         (name, area_id, device_id, lat, lng, str(payload.get("description", "")).strip(), point_id),
@@ -2434,6 +2756,7 @@ async def api_create_route(request: Request) -> JSONResponse:
     area_id = payload.get("areaId")
     if area_id is not None:
         area_id = parse_strict_id(area_id, "areaId")
+    ensure_area_exists(area_id)
     execute_write(
         "INSERT INTO routes (name, description, area_id, created_at) VALUES (%s, %s, %s, %s)",
         (name, str(payload.get("description", "")).strip(), area_id, datetime.now()),
@@ -2452,6 +2775,7 @@ async def api_update_route(route_id: int, request: Request) -> JSONResponse:
     area_id = payload.get("areaId")
     if area_id is not None:
         area_id = parse_strict_id(area_id, "areaId")
+    ensure_area_exists(area_id)
     affected = execute_write(
         "UPDATE routes SET name=%s, description=%s, area_id=%s WHERE id=%s",
         (name, str(payload.get("description", "")).strip(), area_id, route_id),
@@ -2489,20 +2813,37 @@ async def api_route_points_set(route_id: int, request: Request) -> JSONResponse:
     point_ids = payload.get("pointIds", [])
     if not isinstance(point_ids, list):
         raise HTTPException(status_code=422, detail="pointIds 必须是数组。")
+    normalized_point_ids: list[int] = []
+    seen_point_ids: set[int] = set()
+    for index, pid in enumerate(point_ids):
+        point_id = parse_strict_id(pid, f"pointIds[{index}]")
+        if point_id in seen_point_ids:
+            raise HTTPException(status_code=422, detail="路线点位不能重复。")
+        seen_point_ids.add(point_id)
+        normalized_point_ids.append(point_id)
+    if normalized_point_ids:
+        placeholders = ", ".join(["%s"] * len(normalized_point_ids))
+        existing_rows = query_all(
+            f"SELECT id FROM points WHERE id IN ({placeholders})",
+            tuple(normalized_point_ids),
+        )
+        existing_ids = {int(row["id"]) for row in existing_rows}
+        missing_ids = [pid for pid in normalized_point_ids if pid not in existing_ids]
+        if missing_ids:
+            raise HTTPException(status_code=422, detail=f"存在无效巡检点：{', '.join(map(str, missing_ids))}")
     connection = get_db()
     try:
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM route_points WHERE route_id = %s", (route_id,))
-            for order, pid in enumerate(point_ids):
-                pid = parse_strict_id(pid, f"pointIds[{order}]")
+            for sort_order, point_id in enumerate(normalized_point_ids):
                 cursor.execute(
                     "INSERT INTO route_points (route_id, point_id, sort_order) VALUES (%s, %s, %s)",
-                    (route_id, pid, order),
+                    (route_id, point_id, sort_order),
                 )
         connection.commit()
     finally:
         connection.close()
-    return JSONResponse({"ok": True, "count": len(point_ids)})
+    return JSONResponse({"ok": True, "count": len(normalized_point_ids)})
 
 
 # 设备通信（物联网对接）

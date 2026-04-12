@@ -20,6 +20,13 @@ const state = {
   data: null,
   maps: {},
   pageData: {},
+  paging: {
+    areas: { page: 1, size: 20, keyword: "" },
+    zones: { page: 1, size: 20 },
+    reports: { page: 1, size: 20 },
+  },
+  areaSelection: [],
+  areaDeleteError: "",
   routeEditor: { routeId: null, selected: [] },
   pointDraft: {
     coords: null,
@@ -697,6 +704,10 @@ function renderTasksPage() {
 }
 
 function renderReportsPage() {
+  const reportsData = state.pageData.reports;
+  if (!reportsData) {
+    return renderLoadingPage("历史报告", "查看历史报告并维护统计卡片。");
+  }
   return `
     ${renderStats()}
     <section class="dual-grid">
@@ -718,7 +729,7 @@ function renderReportsPage() {
       <article class="panel">
         <div class="panel-header"><div><h2>历史报告</h2><p class="muted">已有管理统计快照</p></div></div>
         <div class="metric-grid">
-          ${state.data.reports.length ? state.data.reports.map((report) => `
+          ${reportsData.items.length ? reportsData.items.map((report) => `
             <article class="metric-card">
               <strong>${escapeHtml(report.title)}</strong>
               <div class="inline-meta">
@@ -728,11 +739,12 @@ function renderReportsPage() {
               <p>${escapeHtml(report.detail || "暂无说明。")}</p>
               <div class="button-row">
                 <span class="muted">${escapeHtml(report.reportDate)}</span>
-                <button class="danger-button" data-delete="reports" data-id="${report.id}">删除</button>
+                <button class="danger-button" type="button" data-report-delete data-id="${report.id}">删除</button>
               </div>
             </article>
           `).join("") : `<div class="empty-state">暂无报告数据。</div>`}
         </div>
+        ${renderPagination("reports", reportsData, "份报告")}
       </article>
     </section>
   `;
@@ -864,6 +876,10 @@ function renderMaintenancePage() {
 }
 
 function renderZonesPage() {
+  const zonesData = state.pageData.zones;
+  if (!zonesData) {
+    return renderLoadingPage("区域控制", "创建、编辑和删除巡检区域。");
+  }
   return `
     ${renderStats()}
     <section class="dual-grid">
@@ -899,7 +915,7 @@ function renderZonesPage() {
         <div class="panel-header"><div><h2>区域列表</h2><p class="muted">已保存区域与风险标签</p></div></div>
         <div id="zones-map" class="map-shell"><div class="map-fallback">检测到高德地图后将在此渲染。</div></div>
         <div class="list-stack">
-          ${state.data.zones.length ? state.data.zones.map((zone) => `
+          ${zonesData.items.length ? zonesData.items.map((zone) => `
             <div class="list-item">
               <div>
                 <strong>${escapeHtml(zone.name)}</strong>
@@ -916,6 +932,7 @@ function renderZonesPage() {
             </div>
           `).join("") : `<div class="empty-state">暂无区域配置。</div>`}
         </div>
+        ${renderPagination("zones", zonesData, "个区域")}
       </article>
     </section>
   `;
@@ -1063,6 +1080,62 @@ function findPageItem(pageId, itemId) {
   return items.find((item) => Number(item.id) === Number(itemId)) || null;
 }
 
+function safePageValue(value, fallback = 1) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function safePageSize(value, fallback = 20) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, 100);
+}
+
+function normalizePagedPayload(payload, fallbackPage = 1, fallbackSize = 20) {
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  const size = safePageSize(payload?.size, fallbackSize);
+  const total = Math.max(0, Number(payload?.total) || 0);
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  const page = Math.min(totalPages, safePageValue(payload?.page, fallbackPage));
+  return { items, total, page, size };
+}
+
+function ensureExistingAreaSelection() {
+  const currentItems = state.pageData.areas?.items || [];
+  const idSet = new Set(currentItems.map((item) => Number(item.id)));
+  state.areaSelection = state.areaSelection.filter((id) => idSet.has(Number(id)));
+}
+
+function renderPagination(pageId, payload, label = "条") {
+  const page = safePageValue(payload?.page, 1);
+  const size = safePageSize(payload?.size, 20);
+  const total = Math.max(0, Number(payload?.total) || 0);
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  const disablePrev = page <= 1;
+  const disableNext = page >= totalPages;
+  return `
+    <div class="pagination-bar">
+      <span class="muted">共 ${total} ${escapeHtml(label)}，第 ${page} / ${totalPages} 页</span>
+      <div class="button-row">
+        <button class="secondary-button" type="button" data-page-nav="${pageId}" data-page-target="${page - 1}"${disablePrev ? " disabled" : ""}>上一页</button>
+        <button class="secondary-button" type="button" data-page-nav="${pageId}" data-page-target="${page + 1}"${disableNext ? " disabled" : ""}>下一页</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindPagination(pageId) {
+  document.querySelectorAll(`[data-page-nav="${pageId}"]`).forEach((button) => {
+    button.addEventListener("click", async () => {
+      const targetPage = safePageValue(button.dataset.pageTarget, state.paging[pageId]?.page || 1);
+      if (!state.paging[pageId]) return;
+      if (targetPage === state.paging[pageId].page) return;
+      state.paging[pageId].page = targetPage;
+      await ensureManagementPageData(pageId, true);
+    });
+  });
+}
+
 async function ensureManagementPageData(pageId, force = false) {
   if (!force && state.pageData[pageId]) {
     return state.pageData[pageId];
@@ -1071,14 +1144,33 @@ async function ensureManagementPageData(pageId, force = false) {
   if (pageId === "users") {
     state.pageData.users = await apiFetch("/api/users?page=1&size=100");
   } else if (pageId === "devices") {
-    const [devices, areas] = await Promise.all([apiFetch("/api/devices"), apiFetch("/api/areas")]);
+    const [devices, areas] = await Promise.all([apiFetch("/api/devices"), apiFetch("/api/areas?page=1&size=100")]);
     state.pageData.devices = { items: devices.items || [], areas: areas.items || [] };
   } else if (pageId === "areas") {
-    state.pageData.areas = await apiFetch("/api/areas");
+    const paging = state.paging.areas;
+    const query = new URLSearchParams({
+      page: String(safePageValue(paging.page, 1)),
+      size: String(safePageSize(paging.size, 20)),
+    });
+    if (paging.keyword?.trim()) {
+      query.set("keyword", paging.keyword.trim());
+    }
+    let payload = normalizePagedPayload(await apiFetch(`/api/areas?${query.toString()}`), paging.page, paging.size);
+    const totalPages = Math.max(1, Math.ceil(payload.total / payload.size));
+    if (paging.page > totalPages && payload.total > 0) {
+      paging.page = totalPages;
+      query.set("page", String(totalPages));
+      payload = normalizePagedPayload(await apiFetch(`/api/areas?${query.toString()}`), paging.page, paging.size);
+    } else {
+      paging.page = payload.page;
+      paging.size = payload.size;
+    }
+    state.pageData.areas = payload;
+    ensureExistingAreaSelection();
   } else if (pageId === "points") {
     const [points, areas, devices] = await Promise.all([
       apiFetch("/api/points"),
-      apiFetch("/api/areas"),
+      apiFetch("/api/areas?page=1&size=100"),
       apiFetch("/api/devices"),
     ]);
     state.pageData.points = {
@@ -1090,7 +1182,7 @@ async function ensureManagementPageData(pageId, force = false) {
     const previousRoutePoints = state.pageData.routes?.routePoints || {};
     const [routes, areas, points] = await Promise.all([
       apiFetch("/api/routes"),
-      apiFetch("/api/areas"),
+      apiFetch("/api/areas?page=1&size=100"),
       apiFetch("/api/points"),
     ]);
     state.pageData.routes = {
@@ -1105,6 +1197,40 @@ async function ensureManagementPageData(pageId, force = false) {
     ) {
       state.routeEditor = { routeId: null, selected: [] };
     }
+  } else if (pageId === "zones") {
+    const paging = state.paging.zones;
+    const query = new URLSearchParams({
+      page: String(safePageValue(paging.page, 1)),
+      size: String(safePageSize(paging.size, 20)),
+    });
+    let payload = normalizePagedPayload(await apiFetch(`/api/zones?${query.toString()}`), paging.page, paging.size);
+    const totalPages = Math.max(1, Math.ceil(payload.total / payload.size));
+    if (paging.page > totalPages && payload.total > 0) {
+      paging.page = totalPages;
+      query.set("page", String(totalPages));
+      payload = normalizePagedPayload(await apiFetch(`/api/zones?${query.toString()}`), paging.page, paging.size);
+    } else {
+      paging.page = payload.page;
+      paging.size = payload.size;
+    }
+    state.pageData.zones = payload;
+  } else if (pageId === "reports") {
+    const paging = state.paging.reports;
+    const query = new URLSearchParams({
+      page: String(safePageValue(paging.page, 1)),
+      size: String(safePageSize(paging.size, 20)),
+    });
+    let payload = normalizePagedPayload(await apiFetch(`/api/reports?${query.toString()}`), paging.page, paging.size);
+    const totalPages = Math.max(1, Math.ceil(payload.total / payload.size));
+    if (paging.page > totalPages && payload.total > 0) {
+      paging.page = totalPages;
+      query.set("page", String(totalPages));
+      payload = normalizePagedPayload(await apiFetch(`/api/reports?${query.toString()}`), paging.page, paging.size);
+    } else {
+      paging.page = payload.page;
+      paging.size = payload.size;
+    }
+    state.pageData.reports = payload;
   }
 
   if (state.pageId === pageId) {
@@ -1443,8 +1569,14 @@ function renderAreasPage() {
   if (!areasData) {
     return renderLoadingPage("区域管理", "管理巡检区域。");
   }
+  ensureExistingAreaSelection();
+  const selectedIds = new Set((state.areaSelection || []).map((id) => Number(id)));
+  const allSelected = areasData.items.length > 0 && areasData.items.every((area) => selectedIds.has(Number(area.id)));
   const rows = (areasData.items || []).map((area) => `
     <tr>
+      <td class="table-select-cell">
+        <input class="table-checkbox" type="checkbox" data-area-select value="${area.id}"${selectedIds.has(Number(area.id)) ? " checked" : ""} />
+      </td>
       <td>${escapeHtml(area.name)}</td>
       <td>${escapeHtml(area.manager || "-")}</td>
       <td>${escapeHtml(area.description || "-")}</td>
@@ -1482,10 +1614,27 @@ function renderAreasPage() {
         <div class="panel-header">
           <div>
             <h2>区域列表</h2>
-            <p class="muted">删除区域后，后端会解除相关关联。</p>
+            <p class="muted">支持关键词搜索、批量删除和分页浏览。</p>
+          </div>
+          <div class="panel-actions toolbar-filters">
+            <form id="area-search-form" class="inline-meta">
+              <input id="area-search-keyword" type="search" value="${escapeHtml(state.paging.areas.keyword || "")}" placeholder="搜索名称 / 负责人 / 描述" />
+              <button class="primary-button" type="submit">搜索</button>
+              <button class="secondary-button" id="area-search-reset" type="button">重置</button>
+            </form>
+            <button class="danger-button" type="button" id="areas-batch-delete"${state.areaSelection.length ? "" : " disabled"}>批量删除（${state.areaSelection.length}）</button>
           </div>
         </div>
-        ${renderTable("areas", ["名称", "负责人", "描述", "创建时间", "操作"], rows)}
+        ${renderTable("areas", [
+          `<input class="table-checkbox" id="area-select-all" type="checkbox"${allSelected ? " checked" : ""} aria-label="全选当前页区域" />`,
+          "名称",
+          "负责人",
+          "描述",
+          "创建时间",
+          "操作",
+        ], rows)}
+        ${state.areaDeleteError ? `<p class="form-error">${escapeHtml(state.areaDeleteError)}</p>` : ""}
+        ${renderPagination("areas", areasData, "个区域")}
       </article>
     </section>
   `;
@@ -1826,7 +1975,66 @@ function bindAreasPage() {
   bindManagedForm("area-form", "area", async (form) => {
     await apiFetch("/api/areas", { method: "POST", body: JSON.stringify(formToObject(form)) });
     form.reset();
+    state.paging.areas.page = 1;
+    state.areaSelection = [];
+    state.areaDeleteError = "";
     await ensureManagementPageData("areas", true);
+  });
+  bindPagination("areas");
+  document.getElementById("area-search-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    state.paging.areas.keyword = document.getElementById("area-search-keyword")?.value?.trim() || "";
+    state.paging.areas.page = 1;
+    state.areaSelection = [];
+    state.areaDeleteError = "";
+    await ensureManagementPageData("areas", true);
+  });
+  document.getElementById("area-search-reset")?.addEventListener("click", async () => {
+    state.paging.areas.keyword = "";
+    state.paging.areas.page = 1;
+    state.areaSelection = [];
+    state.areaDeleteError = "";
+    await ensureManagementPageData("areas", true);
+  });
+  document.getElementById("area-select-all")?.addEventListener("change", (event) => {
+    const checked = Boolean(event.target.checked);
+    const visibleIds = (state.pageData.areas?.items || []).map((item) => Number(item.id));
+    if (checked) {
+      state.areaSelection = Array.from(new Set([...state.areaSelection, ...visibleIds]));
+    } else {
+      const hidden = new Set(visibleIds);
+      state.areaSelection = state.areaSelection.filter((id) => !hidden.has(Number(id)));
+    }
+    renderCurrentPage();
+  });
+  document.querySelectorAll("[data-area-select]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const areaId = Number(checkbox.value);
+      if (checkbox.checked) {
+        if (!state.areaSelection.includes(areaId)) {
+          state.areaSelection = [...state.areaSelection, areaId];
+        }
+      } else {
+        state.areaSelection = state.areaSelection.filter((id) => Number(id) !== areaId);
+      }
+      renderCurrentPage();
+    });
+  });
+  document.getElementById("areas-batch-delete")?.addEventListener("click", async () => {
+    if (!state.areaSelection.length) return;
+    if (!window.confirm(`确认批量删除选中的 ${state.areaSelection.length} 个区域？`)) return;
+    state.areaDeleteError = "";
+    try {
+      await apiFetch("/api/areas/batch-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: state.areaSelection }),
+      });
+      state.areaSelection = [];
+      await ensureManagementPageData("areas", true);
+    } catch (error) {
+      state.areaDeleteError = error.message;
+      renderCurrentPage();
+    }
   });
   document.querySelectorAll("[data-area-edit]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1850,6 +2058,7 @@ function bindAreasPage() {
             method: "PUT",
             body: JSON.stringify(payload),
           });
+          state.areaDeleteError = "";
           await ensureManagementPageData("areas", true);
         },
       });
@@ -1858,10 +2067,75 @@ function bindAreasPage() {
   document.querySelectorAll("[data-area-delete]").forEach((button) => {
     button.addEventListener("click", async () => {
       if (!window.confirm("确认删除该区域？")) return;
-      await apiFetch(`/api/areas/${button.dataset.id}`, { method: "DELETE" });
-      await ensureManagementPageData("areas", true);
+      state.areaDeleteError = "";
+      try {
+        await apiFetch(`/api/areas/${button.dataset.id}`, { method: "DELETE" });
+        state.areaSelection = state.areaSelection.filter((id) => Number(id) !== Number(button.dataset.id));
+        await ensureManagementPageData("areas", true);
+      } catch (error) {
+        state.areaDeleteError = error.message;
+        renderCurrentPage();
+      }
     });
   });
+}
+
+function bindReportsPage() {
+  if (!state.pageData.reports) {
+    void ensureManagementPageData("reports");
+    return;
+  }
+  const form = document.getElementById("report-form");
+  if (form) {
+    applyFriendlyFormDefaults("report", form);
+  }
+  bindManagedForm("report-form", "report", async (form) => {
+    await apiFetch("/api/reports", { method: "POST", body: JSON.stringify(formToObject(form)) });
+    form.reset();
+    applyFriendlyFormDefaults("report", form);
+    state.paging.reports.page = 1;
+    await Promise.all([loadDashboard(), ensureManagementPageData("reports", true)]);
+  });
+  bindPagination("reports");
+  document.querySelectorAll("[data-report-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.confirm("确认删除该报告？")) return;
+      await apiFetch(`/api/reports/${button.dataset.id}`, { method: "DELETE" });
+      await Promise.all([loadDashboard(), ensureManagementPageData("reports", true)]);
+    });
+  });
+}
+
+function bindZonesPage() {
+  if (!state.pageData.zones) {
+    void ensureManagementPageData("zones");
+    return;
+  }
+  const form = document.getElementById("zone-form");
+  if (form) {
+    applyFriendlyFormDefaults("zone", form);
+  }
+  bindManagedForm("zone-form", "zone", async (form) => {
+    if (state.zoneDraft.path.length < 3) {
+      throw new Error("请先在地图上绘制至少 3 个点的区域。");
+    }
+    if (!state.zoneDraft.complete) {
+      throw new Error("请双击地图完成区域绘制后再提交。");
+    }
+    const payload = {
+      ...formToObject(form),
+      path: state.zoneDraft.path,
+      strokeColor: state.zoneDraft.strokeColor,
+      fillColor: state.zoneDraft.fillColor,
+    };
+    await apiFetch("/api/zones", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    applyFriendlyFormDefaults("zone", form);
+    resetZoneDraft();
+    state.paging.zones.page = 1;
+    await Promise.all([loadDashboard(), ensureManagementPageData("zones", true)]);
+  });
+  bindPagination("zones");
 }
 
 function bindPointsPage() {
@@ -2152,7 +2426,7 @@ function bindZoneTools() {
   });
   document.querySelectorAll("[data-zone-edit]").forEach((button) => {
     button.addEventListener("click", () => {
-      const zone = (state.data?.zones || []).find((item) => Number(item.id) === Number(button.dataset.id));
+      const zone = findPageItem("zones", button.dataset.id);
       if (!zone) return;
       showCrudModal({
         title: `编辑区域：${zone.name}`,
@@ -2205,7 +2479,7 @@ function bindZoneTools() {
             method: "PUT",
             body: JSON.stringify(payload),
           });
-          await loadDashboard();
+          await Promise.all([loadDashboard(), ensureManagementPageData("zones", true)]);
         },
       });
     });
@@ -2214,7 +2488,7 @@ function bindZoneTools() {
     button.addEventListener("click", async () => {
       if (!window.confirm("确认删除该区域？")) return;
       await apiFetch(`/api/zones/${button.dataset.id}`, { method: "DELETE" });
-      await loadDashboard();
+      await Promise.all([loadDashboard(), ensureManagementPageData("zones", true)]);
     });
   });
   syncZoneDraftUi();
@@ -2259,24 +2533,11 @@ function bindForms() {
   handleCreate("task", "/api/tasks");
   handleCreate("robot", "/api/robots", (payload) => numericPayload(payload, ["zoneId", "health", "battery", "speed", "signal", "latency", "lng", "lat", "heading"]));
   handleCreate("alert", "/api/alerts");
-  handleCreate("report", "/api/reports");
-  handleCreate("zone", "/api/zones", (payload) => {
-    if (state.zoneDraft.path.length < 3) {
-      throw new Error("请先在地图上绘制至少 3 个点的区域。");
-    }
-    if (!state.zoneDraft.complete) {
-      throw new Error("请双击地图完成区域绘制后再提交。");
-    }
-    return {
-      ...payload,
-      path: state.zoneDraft.path,
-      strokeColor: state.zoneDraft.strokeColor,
-      fillColor: state.zoneDraft.fillColor,
-    };
-  });
   bindZoneTools();
   bindRobotDiscoveryTools();
   bindDeleteButtons();
+  if (state.pageId === "reports") bindReportsPage();
+  if (state.pageId === "zones") bindZonesPage();
   if (state.pageId === "users") bindUsersPage();
   if (state.pageId === "devices") bindDevicesPage();
   if (state.pageId === "areas") bindAreasPage();
